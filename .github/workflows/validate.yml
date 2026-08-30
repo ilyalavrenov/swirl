@@ -1,0 +1,51 @@
+name: validate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0 # zizmor: ignore[cache-poisoning]
+        with:
+          go-version-file: go.mod
+      - run: go mod tidy -diff
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          # renovate: datasource=github-releases depName=golangci/golangci-lint
+          version: "v2.13.2"
+      - uses: reviewdog/action-actionlint@dbe5299849118fd6f099ba563d263d770955a64a # v1.73.2
+        with:
+          reporter: github-check
+          filter_mode: nofilter
+          fail_level: error
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          advanced-security: false
+          annotations: true
+      - run: go test -race ./...
+      - run: go run "golang.org/x/vuln/cmd/govulncheck@${VULN_VERSION}" ./...
+        env:
+          # renovate: datasource=go depName=golang.org/x/vuln
+          VULN_VERSION: "v1.7.0"
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          install-only: true
+      - run: goreleaser check
+      - run: goreleaser build --snapshot --clean

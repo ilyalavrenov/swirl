@@ -1,0 +1,291 @@
+package chd
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ilyalavrenov/swirl/internal/disc"
+)
+
+// makeTrack varies the bytes within each 16-bit pair. A fixture of one repeated
+// byte is blind to audio byte swapping, which would let that code change without
+// moving any digest this suite pins.
+func makeTrack(number int, trackType string, sectors, pregap int, fill byte) Track {
+	data := make([]byte, sectors*sectorBytes)
+	for i := range data {
+		data[i] = fill ^ byte(i)
+	}
+
+	return Track{
+		Number: number,
+		Type:   trackType,
+		Frames: sectors,
+		Pregap: pregap,
+		Data:   bytes.NewReader(data),
+	}
+}
+
+func writeCHD(t *testing.T, tracks []Track) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "disc.chd")
+	require.NoError(t, Write(t.Context(), path, tracks, io.Discard))
+
+	return path
+}
+
+// metadataTexts walks the metadata chain straight out of the file bytes: a
+// 16-byte entry header of tag, flags, uint24 length and uint64 next-offset, then
+// the payload. Deliberately not readMetaChain, so the assertions pin the bytes
+// libchdr will sscanf rather than agreeing with this package's own parser.
+func metadataTexts(t *testing.T, path string) []string {
+	t.Helper()
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	var (
+		texts []string
+		off   = int(binary.BigEndian.Uint64(raw[0x30:]))
+	)
+
+	for off != 0 {
+		require.Less(t, off+metaEntryHeaderBytes, len(raw), "metadata offset inside the file")
+
+		length := int(binary.BigEndian.Uint32(raw[off+4:]) & mask24)
+		next := int(binary.BigEndian.Uint64(raw[off+8:]))
+
+		payload := raw[off+metaEntryHeaderBytes : off+metaEntryHeaderBytes+length]
+		texts = append(texts, strings.TrimRight(string(payload), "\x00"))
+		off = next
+	}
+
+	return texts
+}
+
+func TestWriteSingleDataTrack(t *testing.T) {
+	t.Parallel()
+
+	got := metadataTexts(t, writeCHD(t, []Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0xAB)}))
+
+	assert.Equal(t, []string{
+		"TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:8 PREGAP:0 PGTYPE:MODE1 PGSUB:NONE POSTGAP:0",
+	}, got, "8 frames is already a multiple of the track padding")
+}
+
+// TestWriteMetadataFramesPadded is a regression test: FRAMES must be the padded
+// count, not the raw source count, because libchdr uses it to compute where each
+// following track starts.
+func TestWriteMetadataFramesPadded(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct{ frames, want int }{
+		"rounds up to the first block":  {1, 4},
+		"rounds up to the second block": {5, 8},
+		"rounds up to the third block":  {9, 12},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := metadataTexts(t, writeCHD(t, []Track{makeTrack(1, disc.TrackTypeMode1, test.frames, 0, 0xAA)}))
+			require.Len(t, got, 1)
+			assert.Contains(t, got[0], fmt.Sprintf("FRAMES:%d ", test.want), "PadFrames(%d)", test.frames)
+		})
+	}
+}
+
+// TestWriteMetadataNoPregap is a regression test: Flycast reports "Unsupported
+// subtype or pre/postgap" when PREGAP is non-zero, so the pregap is stored as
+// ordinary track frames and the field stays 0 whatever the input says.
+func TestWriteMetadataNoPregap(t *testing.T) {
+	t.Parallel()
+
+	const pregap = 150 // a full CD lead-in
+
+	got := metadataTexts(t, writeCHD(t, []Track{makeTrack(1, disc.TrackTypeAudio, 20, pregap, 0xBB)}))
+	require.Len(t, got, 1)
+	assert.Contains(t, got[0], "PREGAP:0", "the pregap is stored as track frames, not declared")
+	assert.Contains(t, got[0], "FRAMES:20")
+}
+
+func TestWriteMultiTrack(t *testing.T) {
+	t.Parallel()
+
+	got := metadataTexts(t, writeCHD(t, []Track{
+		makeTrack(1, disc.TrackTypeMode1, 8, 0, 0x01),
+		makeTrack(2, disc.TrackTypeAudio, 8, 2, 0x02),
+		makeTrack(3, disc.TrackTypeMode1, 8, 0, 0x03),
+	}))
+
+	assert.Equal(t, []string{
+		"TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:8 PREGAP:0 PGTYPE:MODE1 PGSUB:NONE POSTGAP:0",
+		"TRACK:2 TYPE:AUDIO SUBTYPE:NONE FRAMES:8 PREGAP:0 PGTYPE:AUDIO PGSUB:NONE POSTGAP:0",
+		"TRACK:3 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:8 PREGAP:0 PGTYPE:MODE1 PGSUB:NONE POSTGAP:0",
+	}, got)
+}
+
+func TestWriteSectorDataRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	// Fill each sector with its own index so a reordering is visible.
+	const sectors = 16
+
+	data := make([]byte, sectors*sectorBytes)
+	for i := range data {
+		data[i] = byte(i / sectorBytes)
+	}
+
+	path := writeCHD(t, []Track{{
+		Number: 1,
+		Type:   disc.TrackTypeMode1,
+		Frames: sectors,
+		Data:   bytes.NewReader(data),
+	}})
+
+	outputDir := t.TempDir()
+	_, err := Read(t.Context(), path, outputDir, io.Discard)
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(filepath.Join(outputDir, "track01.bin"))
+	require.NoError(t, err)
+
+	for sec := range sectors {
+		assert.Equal(t, data[sec*sectorBytes:(sec+1)*sectorBytes],
+			got[sec*sectorBytes:(sec+1)*sectorBytes], "sector %d", sec)
+	}
+}
+
+// TestWriteHeader pins the CHD v5 header layout with literal offsets rather than
+// this package's own parser.
+func TestWriteHeader(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(writeCHD(t, []Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0x00)}))
+	require.NoError(t, err)
+
+	assert.Equal(t, headerMagic, string(raw[0x00:0x08]))
+	assert.Equal(t, []byte{0, 0, 0, chdVersion}, raw[0x0C:0x10], "version")
+	assert.Equal(t, []byte("cdzl"), raw[0x10:0x14], "compressors[0]")
+	assert.Equal(t, make([]byte, 12), raw[0x14:0x20], "compressors[1..3] must be unset")
+}
+
+// TestWriteStoredFramesOverride is a regression test for GD-ROM bridge padding:
+// with StoredFrames set, FRAMES must report it rather than the padded real count,
+// so the following track lands where a GD-ROM reader expects it.
+func TestWriteStoredFramesOverride(t *testing.T) {
+	t.Parallel()
+
+	const bridgeStoredFrames = 20
+
+	got := metadataTexts(t, writeCHD(t, []Track{
+		makeTrack(1, disc.TrackTypeMode1, 4, 0, 0x01),
+		{
+			Number:       2,
+			Type:         disc.TrackTypeAudio,
+			Frames:       4,
+			StoredFrames: bridgeStoredFrames,
+			Data:         bytes.NewReader(bytes.Repeat([]byte{0x02}, 4*sectorBytes)),
+		},
+		makeTrack(3, disc.TrackTypeMode1, 4, 0, 0x03),
+	}))
+
+	require.Len(t, got, 3)
+	assert.Contains(t, got[1], fmt.Sprintf("FRAMES:%d ", bridgeStoredFrames), "bridge honours StoredFrames")
+	assert.Contains(t, got[0], "FRAMES:4 ", "track before the bridge is unaffected")
+	assert.Contains(t, got[2], "FRAMES:4 ", "track after the bridge is unaffected")
+}
+
+func TestWriteMapIsHunkAligned(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(writeCHD(t, []Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0x00)}))
+	require.NoError(t, err)
+
+	firstOffset := firstHunkOffset(t, raw)
+
+	assert.Zero(t, firstOffset%hunkBytes, "hunk data must start on a hunk boundary")
+	assert.Less(t, firstOffset, int64(len(raw)))
+}
+
+func TestCRC16CCITT(t *testing.T) {
+	t.Parallel()
+
+	// Standard check value for CRC-16/CCITT-FALSE, the variant the CHD map uses:
+	// polynomial 0x1021, initial value 0xFFFF, no reflection.
+	assert.Equal(t, uint16(0x29B1), crc16CCITT([]byte("123456789")))
+}
+
+// firstHunkOffset reads hunk 0's absolute file offset from bytes [4..9] of the
+// compressed map header, a 48-bit big-endian value.
+func firstHunkOffset(t *testing.T, raw []byte) int64 {
+	t.Helper()
+
+	mapOffset := int64(binary.BigEndian.Uint64(raw[0x28:]))
+	require.Less(t, mapOffset+mapHeaderBytes, int64(len(raw)), "map header must be inside the file")
+
+	return uint48BE(raw[mapOffset+2:])
+}
+
+func TestNilProgress(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "disc.chd")
+	require.NoError(t, Write(t.Context(), path, []Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0x01)}, nil))
+
+	tracks, err := Read(t.Context(), path, t.TempDir(), nil)
+	require.NoError(t, err)
+	assert.Len(t, tracks, 1)
+}
+
+func TestWriteBytes(t *testing.T) {
+	t.Parallel()
+
+	// 8 frames fills exactly one hunk; 9 spills into a second.
+	assert.Equal(t, int64(hunkBytes), WriteBytes([]Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0)}))
+	assert.Equal(t, int64(2*hunkBytes), WriteBytes([]Track{makeTrack(1, disc.TrackTypeMode1, 9, 0, 0)}))
+}
+
+// TestCompressBatchStoresIncompressibleHunks covers the branch a Dreamcast disc
+// never reaches: its subcode is always zeros, which leaves enough headroom that
+// deflate wins on every real hunk. The CHD format still allows a stored hunk and
+// the map has to record it as one.
+func TestCompressBatchStoresIncompressibleHunks(t *testing.T) {
+	t.Parallel()
+
+	raw := make([]byte, hunkBytes)
+	_, err := rand.Read(raw)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+
+	records := make([]hunkRecord, 1)
+	require.NoError(t, compressBatch(&buf, records, 0, [][]byte{raw}))
+
+	assert.Equal(t, uint8(mapCompNone), records[0].compType)
+	assert.Equal(t, raw, buf.Bytes(), "an incompressible hunk is stored verbatim")
+	assert.Equal(t, uint32(hunkBytes), records[0].length)
+}
+
+// TestUint48BE pins the full width of a stored file offset: a truncated
+// read agrees with a correct one for anything under 16 MB, which every fixture
+// here is.
+func TestUint48BE(t *testing.T) {
+	t.Parallel()
+
+	const offset = 0xABCDEF012345
+
+	buf := make([]byte, 8)
+	putUint48BE(buf[2:], offset)
+
+	assert.Equal(t, int64(offset), uint48BE(buf))
+}
