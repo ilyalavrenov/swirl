@@ -107,8 +107,16 @@ func TestReadRejectsBadInput(t *testing.T) {
 			want:    "is not supported",
 		},
 		"unsupported codec": {
-			corrupt: func(b []byte) { copy(b[0x10:0x14], "cdlz") },
-			want:    "want cdzl",
+			corrupt: func(b []byte) { copy(b[0x10:0x14], "avhu") },
+			want:    `compressor 0 is "avhu"`,
+		},
+		"unsupported codec in a later slot": {
+			corrupt: func(b []byte) { copy(b[0x14:0x18], "avhu") },
+			want:    `compressor 1 is "avhu"`,
+		},
+		"no compressor at all": {
+			corrupt: func(b []byte) { copy(b[0x10:0x14], "\x00\x00\x00\x00") },
+			want:    `compressor 0 is "\x00\x00\x00\x00"`,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
