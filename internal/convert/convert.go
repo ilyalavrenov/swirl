@@ -398,14 +398,9 @@ func cueSheetFor(tracks []chd.TrackInfo) []string {
 }
 
 func cueStanza(number int, cueType, filename string) []string {
-	// FILE types, which collide with the TRACK vocabulary only by coincidence.
-	fileType := "BINARY"
-	if disc.IsAudio(cueType) {
-		fileType = "AUDIO"
-	}
-
+	// AUDIO is a TRACK datatype, not a FILE type; chdman rejects a sheet using it there.
 	return []string{
-		fmt.Sprintf("FILE %q %s", filename, fileType),
+		fmt.Sprintf("FILE %q BINARY", filename),
 		fmt.Sprintf("  TRACK %02d %s", number, cueType),
 		"    INDEX 01 00:00:00",
 	}
