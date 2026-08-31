@@ -83,23 +83,22 @@ func TestWriteSingleDataTrack(t *testing.T) {
 	}, got, "8 frames is already a multiple of the track padding")
 }
 
-// TestWriteMetadataFramesPadded is a regression test: FRAMES must be the padded
-// count, not the raw source count, because libchdr uses it to compute where each
-// following track starts.
-func TestWriteMetadataFramesPadded(t *testing.T) {
+// MAME derives the padding from FRAMES, so a padded total shifts every following track.
+func TestWriteMetadataFramesIsTheRealCount(t *testing.T) {
 	t.Parallel()
 
-	for name, test := range map[string]struct{ frames, want int }{
-		"rounds up to the first block":  {1, 4},
-		"rounds up to the second block": {5, 8},
-		"rounds up to the third block":  {9, 12},
+	for name, frames := range map[string]int{
+		"one short of a block":  1,
+		"one past a block":      5,
+		"already on a boundary": 8,
+		"two short of a block":  9,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			got := metadataTexts(t, writeCHD(t, []Track{makeTrack(1, disc.TrackTypeMode1, test.frames, 0, 0xAA)}))
+			got := metadataTexts(t, writeCHD(t, []Track{makeTrack(1, disc.TrackTypeMode1, frames, 0, 0xAA)}))
 			require.Len(t, got, 1)
-			assert.Contains(t, got[0], fmt.Sprintf("FRAMES:%d ", test.want), "PadFrames(%d)", test.frames)
+			assert.Contains(t, got[0], fmt.Sprintf("FRAMES:%d ", frames))
 		})
 	}
 }

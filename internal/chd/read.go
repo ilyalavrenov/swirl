@@ -339,7 +339,7 @@ func parseTrackMetas(metas []rawMeta) ([]TrackInfo, error) {
 			continue
 		}
 
-		// Null-terminated ASCII: "TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:452 PAD:0 ...".
+		// Null-terminated ASCII: "TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:450 PREGAP:0 ...".
 		text := strings.TrimRight(string(m.payload), "\x00")
 		kv := parseKV(text)
 
@@ -353,20 +353,24 @@ func parseTrackMetas(metas []rawMeta) ([]TrackInfo, error) {
 			return nil, fmt.Errorf("bad FRAMES in %q: %w", text, err)
 		}
 
-		pad := 0
+		// Only CHGD carries PAD, which makes FRAMES the allocated total; without it FRAMES is
+		// the real count and the padding has to be derived.
+		total, dataFrames := PadFrames(frames), frames
 
 		if s, ok := kv["PAD"]; ok {
-			pad, err = strconv.Atoi(s)
+			pad, err := strconv.Atoi(s)
 			if err != nil {
 				return nil, fmt.Errorf("bad PAD in %q: %w", text, err)
 			}
+
+			total, dataFrames = frames, frames-pad
 		}
 
 		tracks = append(tracks, TrackInfo{
 			Number:      num,
 			CUEType:     chdTypeToCUE(kv["TYPE"]),
-			TotalFrames: frames,
-			RealFrames:  frames - pad,
+			TotalFrames: total,
+			RealFrames:  dataFrames,
 			GDROM:       m.tag == tagCHGD,
 		})
 	}

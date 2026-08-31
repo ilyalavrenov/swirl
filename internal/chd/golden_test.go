@@ -122,7 +122,7 @@ func TestChdmanReadsWhatWriteProduces(t *testing.T) {
 
 	chdman, err := exec.LookPath("chdman")
 	if err != nil {
-		t.Skip("chdman not installed")
+		t.Skip("chdman not installed: swirl's CHD is not being cross-checked")
 	}
 
 	audio := make([]byte, 8*sectorBytes)
@@ -130,8 +130,11 @@ func TestChdmanReadsWhatWriteProduces(t *testing.T) {
 		audio[i] = byte(i*13 + 5)
 	}
 
+	// Not 4-frame aligned, so a padded FRAMES would start the audio three sectors late.
+	const dataFrames = 5
+
 	path := writeCHD(t, []Track{
-		makeTrack(1, "MODE1/2352", 8, 0, 0x5A),
+		makeTrack(1, "MODE1/2352", dataFrames, 0, 0x5A),
 		{Number: 2, Type: "AUDIO", Frames: 8, Data: bytes.NewReader(bytes.Clone(audio))},
 	})
 
@@ -145,13 +148,12 @@ func TestChdmanReadsWhatWriteProduces(t *testing.T) {
 		"extractcd", "-i", path, "-o", filepath.Join(dir, "o.cue"), "-f").CombinedOutput()
 	require.NoError(t, err, "chdman extractcd: %s", out)
 
-	// chdman concatenates a plain CD's tracks into one .bin, so the audio track
-	// begins where the 8-frame data track ends.
+	// chdman concatenates a plain CD's tracks into one .bin.
 	got, err := os.ReadFile(filepath.Join(dir, "o.bin"))
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, len(got), 16*sectorBytes)
-	assert.Equal(t, audio, got[8*sectorBytes:16*sectorBytes],
-		"chdman must see the audio in the order the source had")
+	require.Len(t, got, (dataFrames+8)*sectorBytes, "chdman must see the real track lengths")
+	assert.Equal(t, audio, got[dataFrames*sectorBytes:],
+		"chdman must see the audio in the order the source had, at the sector it starts on")
 }
 
 // testdata/golden-gdrom.chd is the same idea at GD-ROM scale: a 105 MB disc that

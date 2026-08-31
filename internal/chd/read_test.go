@@ -18,7 +18,7 @@ func TestReadExtractsTrackData(t *testing.T) {
 	t.Parallel()
 
 	// Both counts are multiples of the track padding, so these round-trip byte for
-	// byte; see TestReadPadsUnalignedTracks for what happens otherwise.
+	// byte; see TestReadDropsTrackPadding for what happens otherwise.
 	const t1Frames, t2Frames = 12, 8
 
 	// Varied within each 16-bit pair so the audio track's byte swapping shows up.
@@ -161,32 +161,49 @@ func TestReadHunkCRC(t *testing.T) {
 	assert.Positive(t, caughtByFlate, "corruption that breaks the stream must be caught by the decoder")
 }
 
-// TestReadPadsUnalignedTracks documents a known round-trip limitation: tracks are
-// stored padded to a 4-frame boundary and a plain CD's CHT2 metadata has no PAD
-// field, so a track whose length is not a multiple of 4 comes back with up to
-// three trailing zero sectors. GD-ROM images use CHGD, which does carry PAD.
-func TestReadPadsUnalignedTracks(t *testing.T) {
+// Two tracks because trailing zeros on the unaligned track are only half of it: the
+// padding also pushes every later track off its start sector.
+func TestReadDropsTrackPadding(t *testing.T) {
 	t.Parallel()
 
-	const frames = 5
+	const (
+		firstFrames  = 5 // not 4-aligned, so three padding sectors follow
+		secondFrames = 6
+	)
 
-	path := writeCHD(t, []Track{makeTrack(1, disc.TrackTypeMode1, frames, 0, 0x33)})
+	path := writeCHD(t, []Track{
+		makeTrack(1, disc.TrackTypeMode1, firstFrames, 0, 0x33),
+		makeTrack(2, disc.TrackTypeMode1, secondFrames, 0, 0x77),
+	})
 
 	outputDir := t.TempDir()
 
 	tracks, err := Read(t.Context(), path, outputDir, io.Discard)
 	require.NoError(t, err)
-	assert.Equal(t, PadFrames(frames), tracks[0].RealFrames, "padding is indistinguishable from data here")
+	assert.Equal(t, firstFrames, tracks[0].RealFrames)
+	assert.Equal(t, PadFrames(firstFrames), tracks[0].TotalFrames, "the slots are still allocated")
 
-	want := make([]byte, frames*sectorBytes)
-	for i := range want {
-		want[i] = 0x33 ^ byte(i)
+	for name, test := range map[string]struct {
+		file   string
+		frames int
+		fill   byte
+	}{
+		"unaligned first track": {"track01.bin", firstFrames, 0x33},
+		"the track after it":    {"track02.bin", secondFrames, 0x77},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			want := make([]byte, test.frames*sectorBytes)
+			for i := range want {
+				want[i] = test.fill ^ byte(i)
+			}
+
+			got, err := os.ReadFile(filepath.Join(outputDir, test.file))
+			require.NoError(t, err)
+			assert.Equal(t, want, got)
+		})
 	}
-
-	got, err := os.ReadFile(filepath.Join(outputDir, "track01.bin"))
-	require.NoError(t, err)
-	assert.Len(t, got, PadFrames(frames)*sectorBytes)
-	assert.Equal(t, want, got[:frames*sectorBytes], "real sectors survive intact")
 }
 
 func TestLogicalBytes(t *testing.T) {

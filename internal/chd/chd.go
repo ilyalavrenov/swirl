@@ -679,7 +679,9 @@ func isGDROM(tracks []Track) bool {
 	return false
 }
 
-// FRAMES counts allocated sectors, PAD (CHGD only) the empty ones: Flycast derives EndFAD = StartFAD + FRAMES - 1 - PAD.
+// CHGD puts the allocated count in FRAMES and the padding in PAD; Flycast derives
+// EndFAD = StartFAD + FRAMES - 1 - PAD. CHT2 has no PAD, so its FRAMES is the real count,
+// as chdman writes it, or readers take the padding as track data.
 // https://github.com/rtissera/libchdr/blob/5f82799f2c8cad1e9cd26d39a0f8d36369a5534b/include/libchdr/chd.h#L249
 // https://github.com/flyinghead/flycast/blob/e2722869ffb6f404d2056a12653aa67e4210d61d/core/imgread/chd.cpp#L188-L190
 func buildMetaTexts(tracks []Track) [][]byte {
@@ -698,7 +700,7 @@ func buildMetaTexts(tracks []Track) [][]byte {
 		} else {
 			s = fmt.Sprintf(
 				"TRACK:%d TYPE:%s SUBTYPE:NONE FRAMES:%d PREGAP:0 PGTYPE:%s PGSUB:NONE POSTGAP:0",
-				t.Number, chdTrackType(t.Type), ef, pregapType(t.Type),
+				t.Number, chdTrackType(t.Type), t.Frames, pregapType(t.Type),
 			)
 		}
 
