@@ -1,0 +1,171 @@
+version: "2"
+linters:
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - copyloopvar
+    - decorder
+    - dupl
+    - durationcheck
+    - errcheck
+    - errname
+    - errorlint
+    - exhaustive
+    - forcetypeassert
+    - gocheckcompilerdirectives
+    - gochecknoglobals
+    - gochecknoinits
+    - gocognit
+    - goconst
+    - gocritic
+    - godot
+    - goprintffuncname
+    - gosec
+    - govet
+    - iface
+    - ineffassign
+    - intrange
+    - ireturn
+    - lll
+    - makezero
+    - misspell
+    - mnd
+    - modernize
+    - nakedret
+    - nestif
+    - nilerr
+    - nilnil
+    - nlreturn
+    - nolintlint
+    - nonamedreturns
+    - paralleltest
+    - perfsprint
+    - predeclared
+    - reassign
+    - recvcheck
+    - revive
+    - staticcheck
+    - testableexamples
+    - testifylint
+    - thelper
+    - tparallel
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+    - wrapcheck
+  settings:
+    errcheck:
+      check-blank: true
+      check-type-assertions: true
+    exhaustive:
+      check:
+        - switch
+        - map
+    gocognit:
+      min-complexity: 20
+    goconst:
+      min-occurrences: 3
+    gocritic:
+      settings:
+        captLocal:
+          paramsOnly: false
+        underef:
+          skipRecvDeref: false
+    govet:
+      disable:
+        - fieldalignment
+        - shadow
+        - unusedwrite
+      enable-all: true
+    ireturn:
+      allow:
+        - anon
+        - error
+        - empty
+        - stdlib
+    lll:
+      line-length: 140
+    mnd:
+      ignored-numbers:
+        - "0"
+        - "1"
+        - "2"
+      ignored-functions:
+        - strconv.*
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    perfsprint:
+      strconcat: false
+    revive:
+      rules:
+        - name: var-naming
+          arguments:
+            - []
+            - []
+            - - skipPackageNameChecks: true
+    usetesting:
+      os-chdir: true
+      os-mkdir-temp: true
+      os-setenv: true
+      os-temp-dir: true
+      os-create-temp: true
+    whitespace:
+      multi-if: false
+      multi-func: false
+    wrapcheck:
+      ignore-package-globs:
+        - github.com/ilyalavrenov/*
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - godot
+        source: (noinspection|TODO)
+      - linters:
+          - gocritic
+        source: //noinspection
+      - linters:
+          - dupl
+          - errcheck
+          - gocognit
+          - goconst
+          - gosec
+          - mnd
+          - unparam
+          - wrapcheck
+        path: "_test\\.go"
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/ilyalavrenov/swirl)
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
