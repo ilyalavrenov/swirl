@@ -7,6 +7,8 @@ import (
 	"io"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/urfave/cli/v3"
@@ -26,15 +28,25 @@ type trackJSON struct {
 }
 
 type infoJSON struct {
-	File   string      `json:"file"`
-	Name   string      `json:"name,omitempty"`
-	Format string      `json:"format"`
-	GDROM  bool        `json:"gdrom"`
-	Codec  string      `json:"codec,omitempty"`
-	Hunks  int         `json:"hunks,omitempty"`
-	Stored int64       `json:"stored_bytes,omitempty"`
-	Bytes  int64       `json:"bytes"`
-	Tracks []trackJSON `json:"tracks"`
+	File        string      `json:"file"`
+	Name        string      `json:"name,omitempty"`
+	Format      string      `json:"format"`
+	GDROM       bool        `json:"gdrom"`
+	HardwareID  string      `json:"hardware_id,omitempty"`
+	MakerID     string      `json:"maker_id,omitempty"`
+	Maker       string      `json:"maker,omitempty"`
+	ProductNo   string      `json:"product_number,omitempty"`
+	Version     string      `json:"version,omitempty"`
+	ReleaseDate string      `json:"release_date,omitempty"`
+	Disc        string      `json:"disc,omitempty"`
+	Regions     []string    `json:"regions,omitempty"`
+	Peripherals []string    `json:"peripherals,omitempty"`
+	BootFile    string      `json:"boot_filename,omitempty"`
+	Codec       string      `json:"codec,omitempty"`
+	Hunks       int         `json:"hunks,omitempty"`
+	Stored      int64       `json:"stored_bytes,omitempty"`
+	Bytes       int64       `json:"bytes"`
+	Tracks      []trackJSON `json:"tracks"`
 }
 
 type verifyJSON struct {
@@ -85,22 +97,34 @@ func runInfo(_ context.Context, cmd *cli.Command) error {
 
 	fmt.Fprintln(cmd.Writer, filepath.Base(imagePath))
 
-	if desc.Name != "" {
-		fmt.Fprintf(cmd.Writer, "  name    %s\n", desc.Name)
-	}
+	h := desc.IPBin
 
-	fmt.Fprintf(cmd.Writer, "  format  %s\n", desc.Format)
-	fmt.Fprintf(cmd.Writer, "  layout  %s\n", layout)
+	infoRow(cmd.Writer, "name", h.Title)
+	infoRow(cmd.Writer, "maker", h.Maker)
+	infoRow(cmd.Writer, "product", strings.TrimSpace(h.ProductNo+" "+h.Version))
+	infoRow(cmd.Writer, "disc", h.Disc)
+	infoRow(cmd.Writer, "region", strings.Join(h.Regions, ", "))
+	infoRow(cmd.Writer, "date", h.ReleaseDate)
+	infoRow(cmd.Writer, "boot", h.BootFile)
+	infoRow(cmd.Writer, "input", strings.Join(h.Peripherals, ", "))
+	infoRow(cmd.Writer, "format", string(desc.Format))
+	infoRow(cmd.Writer, "layout", layout)
 
 	if desc.Format == convert.FormatCHD {
-		fmt.Fprintf(cmd.Writer, "  codec   %s\n", desc.Codec)
-		fmt.Fprintf(cmd.Writer, "  hunks   %d\n", desc.Hunks)
-		fmt.Fprintf(cmd.Writer, "  stored  %s\n", storedSize(desc))
+		infoRow(cmd.Writer, "codec", desc.Codec)
+		infoRow(cmd.Writer, "hunks", strconv.Itoa(desc.Hunks))
+		infoRow(cmd.Writer, "stored", storedSize(desc))
 	}
 
 	fmt.Fprintf(cmd.Writer, "  tracks  %d (%s)\n\n", len(desc.Tracks), formatBytes(desc.Bytes()))
 
 	return writeTrackTable(cmd.Writer, desc)
+}
+
+func infoRow(w io.Writer, key, value string) {
+	if value != "" {
+		fmt.Fprintf(w, "  %-7s %s\n", key, value)
+	}
 }
 
 func infoOutput(name string, desc convert.Description) infoJSON {
@@ -116,16 +140,28 @@ func infoOutput(name string, desc convert.Description) infoJSON {
 		})
 	}
 
+	h := desc.IPBin
+
 	return infoJSON{
-		File:   name,
-		Name:   desc.Name,
-		Format: string(desc.Format),
-		GDROM:  desc.GDROM,
-		Codec:  desc.Codec,
-		Hunks:  desc.Hunks,
-		Stored: desc.Stored,
-		Bytes:  desc.Bytes(),
-		Tracks: tracks,
+		File:        name,
+		Name:        h.Title,
+		Format:      string(desc.Format),
+		GDROM:       desc.GDROM,
+		HardwareID:  h.HardwareID,
+		MakerID:     h.MakerID,
+		Maker:       h.Maker,
+		ProductNo:   h.ProductNo,
+		Version:     h.Version,
+		ReleaseDate: h.ReleaseDate,
+		Disc:        h.Disc,
+		Regions:     h.Regions,
+		Peripherals: h.Peripherals,
+		BootFile:    h.BootFile,
+		Codec:       desc.Codec,
+		Hunks:       desc.Hunks,
+		Stored:      desc.Stored,
+		Bytes:       desc.Bytes(),
+		Tracks:      tracks,
 	}
 }
 
