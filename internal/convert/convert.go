@@ -46,6 +46,9 @@ type Progress func(Step) io.Writer
 type Options struct {
 	Force bool
 
+	// The compressor for CHD output. Empty means chd.CodecFLAC.
+	Codec chd.Codec
+
 	// Called once per step, before it runs. Nil reports nothing.
 	Progress Progress
 }
@@ -54,6 +57,14 @@ type Result struct {
 	Path   string // the sheet or archive that was written
 	Tracks int
 	Bytes  int64 // track bytes processed, not the size on disk
+}
+
+func (o Options) codec() chd.Codec {
+	if o.Codec == "" {
+		return chd.CodecFLAC
+	}
+
+	return o.Codec
 }
 
 // step never returns nil.
@@ -305,7 +316,7 @@ func writeCHD(ctx context.Context, outputPath string, tracks []chd.Track, opts O
 
 	bar := opts.step(Step{Name: "Writing CHD", Bytes: chd.WriteBytes(tracks)})
 
-	if err := chd.Write(ctx, outputPath, tracks, bar); err != nil {
+	if err := chd.Write(ctx, outputPath, tracks, opts.codec(), bar); err != nil {
 		return Result{}, fmt.Errorf("write CHD: %w", err)
 	}
 

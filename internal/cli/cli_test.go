@@ -99,6 +99,10 @@ func TestConvertRejectsBadArguments(t *testing.T) {
 		"same format":       {[]string{"convert", filepath.Join(dir, "disc.cue"), out, "--to", "cue"}, "nothing to do"},
 		"unreadable input":  {[]string{"convert", filepath.Join(dir, "nope.cue"), out}, "no such file"},
 		"unsupported input": {[]string{"convert", filepath.Join(dir, "track01.bin"), out}, "unknown format"},
+		"unknown codec": {
+			[]string{"convert", filepath.Join(dir, "disc.cue"), out, "--to", "chd", "--codec", "cdxx"},
+			`unknown codec "cdxx"`,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

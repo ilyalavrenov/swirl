@@ -20,6 +20,7 @@ swirl convert "./My Game (Japan)/disc.cue" ./out     # CUE/BIN to GDI
 swirl convert "./My Game (Japan)" ./out/disc.chd     # input dir, CHD out
 swirl convert --to cue ./out/disc.chd ./restored     # format set explicitly
 swirl convert --force ./out/disc.gdi ./out/disc.chd  # replace existing output
+swirl convert --codec cdzl ./d.gdi ./d.chd           # skip FLAC, write faster
 swirl info ./out/disc.chd                            # name, track table, layout
 swirl verify ./out/disc.chd                          # hunk CRCs and header SHA1s
 swirl --json info ./out/disc.chd                     # same, machine-readable
@@ -29,6 +30,10 @@ swirl --json info ./out/disc.chd                     # same, machine-readable
 `<output>` is a file for chd and a directory for cue and gdi. The format follows
 the output extension unless `--to` overrides it. Supported: cue to gdi or chd,
 gdi to cue or chd, chd to cue.
+
+CHD output defaults to `cdzl,cdfl`: audio hunks take the smaller of deflate and
+FLAC, which is roughly a fifth off a disc with a redbook soundtrack. `--codec
+cdzl` deflates everything instead.
 
 Output is staged and renamed into place, so a failed run leaves nothing
 half-written. GDI output gets a `name.txt` holding the IP.BIN game name.

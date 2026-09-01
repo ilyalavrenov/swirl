@@ -193,7 +193,7 @@ func TestWriteAtomic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "disc.chd")
 
-	require.NoError(t, Write(t.Context(), path, []Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0x01)}, nil))
+	require.NoError(t, Write(t.Context(), path, []Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0x01)}, CodecDeflate, nil))
 
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
@@ -214,7 +214,7 @@ func TestWriteFailureKeepsExistingFile(t *testing.T) {
 		Type:   disc.TrackTypeMode1,
 		Frames: 8,
 		Data:   bytes.NewReader(bytes.Repeat([]byte{0x01}, 2*sectorBytes)),
-	}}, nil)
+	}}, CodecDeflate, nil)
 	require.Error(t, err)
 
 	got, err := os.ReadFile(path)

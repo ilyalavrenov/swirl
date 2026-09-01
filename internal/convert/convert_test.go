@@ -306,6 +306,10 @@ func TestGDIToCHD(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.Tracks)
 
+	info, err := chd.Stat(chdPath)
+	require.NoError(t, err)
+	assert.Contains(t, info.Codec, "cdfl", "FLAC is offered by default, for discs with audio tracks")
+
 	outputDir := t.TempDir()
 
 	restored, err := convert.Run(t.Context(), convert.FormatCHD, convert.FormatCUE, chdPath, outputDir, convert.Options{})
@@ -599,7 +603,7 @@ func TestDescribeCHDCountsPadFrames(t *testing.T) {
 		{Number: 1, Type: disc.TrackTypeMode1, Frames: 4, Data: sectors(0x01)},
 		{Number: 2, Type: disc.TrackTypeAudio, Frames: 4, StoredFrames: 16, Data: sectors(0x02)},
 		{Number: 3, Type: disc.TrackTypeMode1, Frames: 4, Data: sectors(0x03)},
-	}, nil))
+	}, chd.CodecDeflate, nil))
 
 	got, err := convert.Describe(convert.FormatCHD, path)
 	require.NoError(t, err)
