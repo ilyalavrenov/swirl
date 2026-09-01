@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,8 +40,14 @@ func makeTrack(number int, trackType string, sectors, pregap int, fill byte) Tra
 func writeCHD(t *testing.T, tracks []Track) string {
 	t.Helper()
 
+	return writeCHDWith(t, tracks, CodecDeflate)
+}
+
+func writeCHDWith(t *testing.T, tracks []Track, codec Codec) string {
+	t.Helper()
+
 	path := filepath.Join(t.TempDir(), "disc.chd")
-	require.NoError(t, Write(t.Context(), path, tracks, io.Discard))
+	require.NoError(t, Write(t.Context(), path, tracks, codec, io.Discard))
 
 	return path
 }
@@ -263,7 +270,7 @@ func TestNilProgress(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "disc.chd")
-	require.NoError(t, Write(t.Context(), path, []Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0x01)}, nil))
+	require.NoError(t, Write(t.Context(), path, []Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0x01)}, CodecDeflate, nil))
 
 	tracks, err := Read(t.Context(), path, t.TempDir(), nil)
 	require.NoError(t, err)
@@ -276,6 +283,37 @@ func TestWriteBytes(t *testing.T) {
 	// 8 frames fills exactly one hunk; 9 spills into a second.
 	assert.Equal(t, int64(hunkBytes), WriteBytes([]Track{makeTrack(1, disc.TrackTypeMode1, 8, 0, 0)}))
 	assert.Equal(t, int64(2*hunkBytes), WriteBytes([]Track{makeTrack(1, disc.TrackTypeMode1, 9, 0, 0)}))
+}
+
+// PCM smooth enough that FLAC beats deflate on it.
+func sinePCM(t *testing.T) []byte {
+	t.Helper()
+
+	buf := make([]byte, hunkBytes)
+	for i := range hunkBytes / audioFrameBytes {
+		at := float64(i) / 44100
+		v := int16(9000*math.Sin(2*math.Pi*220*at) +
+			5000*math.Sin(2*math.Pi*333*at) +
+			2500*math.Sin(2*math.Pi*55*at))
+		binary.BigEndian.PutUint16(buf[i*audioFrameBytes:], uint16(v))
+		binary.BigEndian.PutUint16(buf[i*audioFrameBytes+audioSampleBytes:], uint16(v/2))
+	}
+
+	return buf
+}
+
+func TestCompressHunkTriesFLACOnlyForAudio(t *testing.T) {
+	t.Parallel()
+
+	raw := sinePCM(t)
+
+	_, audioType, err := compressHunk(hunk{data: raw, audio: true}, CodecFLAC)
+	require.NoError(t, err)
+	require.Equal(t, uint8(mapCompType1), audioType, "FLAC must win this hunk when it is audio")
+
+	_, dataType, err := compressHunk(hunk{data: raw, audio: false}, CodecFLAC)
+	require.NoError(t, err)
+	assert.Equal(t, uint8(mapCompType0), dataType, "the same bytes on a data track stay deflate")
 }
 
 func TestCompressBatch(t *testing.T) {
@@ -293,7 +331,7 @@ func TestCompressBatch(t *testing.T) {
 		var buf bytes.Buffer
 
 		records := make([]hunkRecord, 1)
-		require.NoError(t, compressBatch(&buf, records, 0, [][]byte{raw}, map[[sha1.Size]byte]int{}))
+		require.NoError(t, compressBatch(&buf, records, 0, []hunk{{data: raw}}, map[[sha1.Size]byte]int{}, CodecDeflate))
 
 		assert.Equal(t, uint8(mapCompNone), records[0].compType)
 		assert.Equal(t, raw, buf.Bytes(), "an incompressible hunk is stored verbatim")
@@ -306,7 +344,7 @@ func TestCompressBatch(t *testing.T) {
 		var buf bytes.Buffer
 
 		records := make([]hunkRecord, 2)
-		require.NoError(t, compressBatch(&buf, records, 0, [][]byte{raw, raw}, map[[sha1.Size]byte]int{}))
+		require.NoError(t, compressBatch(&buf, records, 0, []hunk{{data: raw}, {data: raw}}, map[[sha1.Size]byte]int{}, CodecDeflate))
 
 		assert.Equal(t, uint8(mapCompSelf), records[1].compType)
 		assert.Equal(t, 0, records[1].selfHunk)

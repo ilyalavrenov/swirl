@@ -71,6 +71,7 @@ const (
 	tagBytes = 4
 
 	headerCodecOffset        = 0x10
+	headerCodecSlotBytes     = 4
 	headerRawSHA1Offset      = 0x40
 	headerCombinedSHA1Offset = 0x54
 
@@ -85,10 +86,11 @@ const (
 
 	huffmanRLEBitWidth = 4
 
-	// The writer's fixed map tree: a compressed hunk in one bit, the four other symbols it
-	// emits in three.
+	// The writer's fixed map tree: a compressed hunk in one bit, the rest in three, and four
+	// where FLAC needs a sixth symbol.
 	mapCommonCodeBits = 1
 	mapOtherCodeBits  = 3
+	mapRareCodeBits   = 4
 
 	crcInitValue  = 0xFFFF
 	crcHighBit    = 0x8000
@@ -104,6 +106,32 @@ const (
 	chdTypeMode1Raw = "MODE1_RAW"
 	chdTypeMode2Raw = "MODE2_RAW"
 )
+
+// Codec is a CHD compressor set, spelled as chdman spells one.
+type Codec string
+
+const (
+	// CodecDeflate deflates every hunk.
+	CodecDeflate Codec = "cdzl"
+
+	// CodecFLAC offers FLAC alongside deflate; it only ever wins on audio hunks.
+	CodecFLAC Codec = "cdzl,cdfl"
+)
+
+// Codecs lists what --codec accepts.
+func Codecs() []Codec {
+	return []Codec{CodecDeflate, CodecFLAC}
+}
+
+func ParseCodec(s string) (Codec, error) {
+	for _, c := range Codecs() {
+		if string(c) == s {
+			return c, nil
+		}
+	}
+
+	return "", fmt.Errorf("unknown codec %q", s)
+}
 
 type Track struct {
 	Number int
@@ -146,7 +174,7 @@ func hunkCount(frames int) int {
 }
 
 type hunkRecord struct {
-	compType uint8 // mapCompType0, mapCompNone or mapCompSelf
+	compType uint8 // a mapCompType* index into the header codecs, mapCompNone, or mapCompSelf
 	length   uint32
 	rawCRC   uint16 // CRC16-CCITT of the uncompressed hunk
 	selfHunk int    // the identical earlier hunk, when compType is mapCompSelf
@@ -156,9 +184,10 @@ type layout struct {
 	metaTexts [][]byte
 	metaTag   uint32
 	numHunks  int
+	codec     Codec
 }
 
-func planLayout(tracks []Track) layout {
+func planLayout(tracks []Track, codec Codec) layout {
 	tag := tagCHT2
 	if isGDROM(tracks) {
 		tag = tagCHGD
@@ -168,12 +197,13 @@ func planLayout(tracks []Track) layout {
 		metaTexts: buildMetaTexts(tracks),
 		metaTag:   tag,
 		numHunks:  hunkCount(storedFrames(tracks)),
+		codec:     codec,
 	}
 }
 
-// Write creates a CDZLIB-compressed CHD v5 file. The output appears only once
-// complete, so cancelling ctx leaves any existing file untouched.
-func Write(ctx context.Context, outputPath string, tracks []Track, progress io.Writer) error {
+// Write creates a compressed CHD v5 file. The output appears only once complete,
+// so cancelling ctx leaves any existing file untouched.
+func Write(ctx context.Context, outputPath string, tracks []Track, codec Codec, progress io.Writer) error {
 	if progress == nil {
 		progress = io.Discard
 	}
@@ -187,7 +217,7 @@ func Write(ctx context.Context, outputPath string, tracks []Track, progress io.W
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
 
-	l := planLayout(tracks)
+	l := planLayout(tracks, codec)
 
 	records, rawSHA1, err := compressHunks(ctx, tmp, l, tracks, progress)
 	if err != nil {
@@ -211,7 +241,7 @@ func compressHunks(
 	seen := make(map[[sha1.Size]byte]int, l.numHunks)
 
 	workers := runtime.NumCPU()
-	batch := make([][]byte, 0, workers)
+	batch := make([]hunk, 0, workers)
 	batchStart := 0
 
 	flush := func() error {
@@ -219,7 +249,7 @@ func compressHunks(
 			return nil
 		}
 
-		if err := compressBatch(tmp, records, batchStart, batch, seen); err != nil {
+		if err := compressBatch(tmp, records, batchStart, batch, seen, l.codec); err != nil {
 			return err
 		}
 
@@ -234,14 +264,14 @@ func compressHunks(
 			return nil, nil, fmt.Errorf("compress hunk %d: %w", batchStart+len(batch), err)
 		}
 
-		buf, err := stream.next()
+		h, err := stream.next()
 		if err != nil {
 			return nil, nil, err
 		}
 
-		rawHash.Write(buf)
-		progress.Write(buf) //nolint:errcheck // progress reporting never affects the result
-		batch = append(batch, buf)
+		rawHash.Write(h.data)
+		progress.Write(h.data) //nolint:errcheck // progress reporting never affects the result
+		batch = append(batch, h)
 
 		if len(batch) == workers {
 			if err := flush(); err != nil {
@@ -257,6 +287,11 @@ func compressHunks(
 	return records, rawHash.Sum(nil), nil
 }
 
+type hunk struct {
+	data  []byte
+	audio bool
+}
+
 // Lays tracks out as fixed-size hunks, zero-filling the slots past each track's data.
 type hunkStream struct {
 	tracks       []Track
@@ -264,8 +299,9 @@ type hunkStream struct {
 	frameInTrack int
 }
 
-func (s *hunkStream) next() ([]byte, error) {
-	buf := make([]byte, hunkBytes)
+func (s *hunkStream) next() (hunk, error) {
+	h := hunk{data: make([]byte, hunkBytes)}
+	buf := h.data
 
 	for slot := range framesPerHunk {
 		for s.trackIdx < len(s.tracks) && s.frameInTrack >= effectiveFrames(s.tracks[s.trackIdx]) {
@@ -276,22 +312,26 @@ func (s *hunkStream) next() ([]byte, error) {
 		if s.trackIdx < len(s.tracks) && s.frameInTrack < s.tracks[s.trackIdx].Frames {
 			off := slot * slotBytes
 			if _, err := io.ReadFull(s.tracks[s.trackIdx].Data, buf[off:off+sectorBytes]); err != nil {
-				return nil, fmt.Errorf("track %d frame %d: %w", s.tracks[s.trackIdx].Number, s.frameInTrack, err)
+				return hunk{}, fmt.Errorf("track %d frame %d: %w", s.tracks[s.trackIdx].Number, s.frameInTrack, err)
 			}
 
 			if disc.IsAudio(s.tracks[s.trackIdx].Type) {
 				swapAudio(buf[off : off+sectorBytes])
+
+				h.audio = true
 			}
 		}
 
 		s.frameInTrack++
 	}
 
-	return buf, nil
+	return h, nil
 }
 
 // Compresses in parallel, writes in stream order, so layout never depends on timing.
-func compressBatch(w io.Writer, records []hunkRecord, start int, batch [][]byte, seen map[[sha1.Size]byte]int) error {
+func compressBatch(
+	w io.Writer, records []hunkRecord, start int, batch []hunk, seen map[[sha1.Size]byte]int, codec Codec,
+) error {
 	type result struct {
 		stored   []byte
 		digest   [sha1.Size]byte
@@ -304,9 +344,9 @@ func compressBatch(w io.Writer, records []hunkRecord, start int, batch [][]byte,
 
 	var wg sync.WaitGroup
 
-	for i, raw := range batch {
+	for i, h := range batch {
 		wg.Go(func() {
-			compressed, err := compressCDZLIB(raw)
+			stored, compType, err := compressHunk(h, codec)
 			if err != nil {
 				results[i].err = err
 
@@ -314,13 +354,10 @@ func compressBatch(w io.Writer, records []hunkRecord, start int, batch [][]byte,
 			}
 
 			results[i] = result{
-				stored:   compressed,
-				digest:   sha1.Sum(raw), //nolint:gosec // G401: names a hunk's content, nothing security rests on it
-				compType: mapCompType0,
-				rawCRC:   crc16CCITT(raw),
-			}
-			if len(compressed) >= len(raw) {
-				results[i].stored, results[i].compType = raw, mapCompNone
+				stored:   stored,
+				digest:   sha1.Sum(h.data), //nolint:gosec // G401: names a hunk's content, nothing security rests on it
+				compType: compType,
+				rawCRC:   crc16CCITT(h.data),
 			}
 		})
 	}
@@ -369,7 +406,7 @@ func assemble(outputPath string, hunks io.Reader, l layout, records []hunkRecord
 
 	types, selfBits := promoteSelf(records)
 
-	mapData, err := encodeMap(records, types, selfBits)
+	mapData, err := encodeMap(records, types, selfBits, l.codec)
 	if err != nil {
 		return err
 	}
@@ -393,7 +430,7 @@ func assemble(outputPath string, hunks io.Reader, l layout, records []hunkRecord
 		name string
 		data []byte
 	}{
-		{"header", makeHeader(int64(l.numHunks)*hunkBytes, mapOffset, metaStart)},
+		{"header", makeHeader(int64(l.numHunks)*hunkBytes, mapOffset, metaStart, l.codec)},
 		{"metadata", buildMetaBytes(l.metaTexts, metaStart, l.metaTag)},
 		{"map header", buildMapHeader(mapData, firstOffset, records, selfBits)},
 		{"map", mapData},
@@ -470,6 +507,49 @@ func writeTuples(l layout) [][]byte {
 	return tuples
 }
 
+// Picks the smallest encoding the codec allows.
+func compressHunk(h hunk, codec Codec) ([]byte, uint8, error) {
+	raw := h.data
+
+	stored, err := compressCDZLIB(raw)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	compType := uint8(mapCompType0)
+
+	if codec == CodecFLAC && h.audio {
+		flacCmp, err := compressCDFLAC(raw)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		if len(flacCmp) < len(stored) {
+			stored, compType = flacCmp, mapCompType1
+		}
+	}
+
+	if len(stored) >= len(raw) {
+		return raw, mapCompNone, nil
+	}
+
+	return stored, compType, nil
+}
+
+// De-interleave: sector and subcode regions compress as separate blocks.
+func splitHunk(hunkData []byte) ([]byte, []byte) {
+	frames := len(hunkData) / slotBytes
+	sectorData := make([]byte, frames*sectorBytes)
+	subcodeData := make([]byte, frames*subcodeBytes)
+
+	for i := range frames {
+		copy(sectorData[i*sectorBytes:], hunkData[i*slotBytes:i*slotBytes+sectorBytes])
+		copy(subcodeData[i*subcodeBytes:], hunkData[i*slotBytes+sectorBytes:i*slotBytes+slotBytes])
+	}
+
+	return sectorData, subcodeData
+}
+
 // CDZLIB wire format: an ECC bitmap of ceil(frames/8) bytes (always 0, we never
 // strip), the 2-byte big-endian length of the deflated sector block, then
 // DEFLATE(sectors) and DEFLATE(subcode). The subcode block must be present even for
@@ -478,15 +558,7 @@ func writeTuples(l layout) [][]byte {
 // https://github.com/rtissera/libchdr/blob/5f82799f2c8cad1e9cd26d39a0f8d36369a5534b/src/libchdr_chd.c#L818
 func compressCDZLIB(hunkData []byte) ([]byte, error) {
 	frames := len(hunkData) / slotBytes
-
-	// De-interleave: sector and subcode regions compress as separate blocks.
-	sectorData := make([]byte, frames*sectorBytes)
-	subcodeData := make([]byte, frames*subcodeBytes)
-
-	for i := range frames {
-		copy(sectorData[i*sectorBytes:], hunkData[i*slotBytes:i*slotBytes+sectorBytes])
-		copy(subcodeData[i*subcodeBytes:], hunkData[i*slotBytes+sectorBytes:i*slotBytes+slotBytes])
-	}
+	sectorData, subcodeData := splitHunk(hunkData)
 
 	baseCmp, err := zlibCompress(sectorData)
 	if err != nil {
@@ -541,12 +613,18 @@ func zlibCompress(data []byte) ([]byte, error) {
 }
 
 // The tree the map's type stream is coded against, as 16 four-bit code lengths.
-func mapCodeLengths() []int {
+func mapCodeLengths(codec Codec) []int {
 	lengths := make([]int, huffmanNumSymbols)
 	lengths[mapCompType0] = mapCommonCodeBits
 
 	for _, sym := range []int{mapCompNone, mapCompSelf, mapCompSelf0, mapCompSelf1} {
 		lengths[sym] = mapOtherCodeBits
+	}
+
+	// A sixth symbol has to come out of the same budget, so the two rarest give up a bit.
+	if codec == CodecFLAC {
+		lengths[mapCompType1] = mapOtherCodeBits
+		lengths[mapCompSelf0], lengths[mapCompSelf1] = mapRareCodeBits, mapRareCodeBits
 	}
 
 	return lengths
@@ -586,8 +664,8 @@ func promoteSelf(records []hunkRecord) ([]uint8, byte) {
 }
 
 // The Huffman+RLE map data, without its 16-byte header.
-func encodeMap(records []hunkRecord, types []uint8, selfBits byte) ([]byte, error) {
-	lengths := mapCodeLengths()
+func encodeMap(records []hunkRecord, types []uint8, selfBits byte, codec Codec) ([]byte, error) {
+	lengths := mapCodeLengths(codec)
 
 	codes, err := buildCanonicalCodes(lengths)
 	if err != nil {
@@ -617,7 +695,7 @@ func encodeMap(records []hunkRecord, types []uint8, selfBits byte) ([]byte, erro
 
 	for i, t := range types {
 		switch t {
-		case mapCompType0:
+		case mapCompType0, mapCompType1:
 			bw.write(records[i].length, lengthBits)
 			bw.write(uint32(records[i].rawCRC), mapCRCBits)
 		case mapCompNone:
@@ -839,14 +917,17 @@ func buildMetaBytes(metaTexts [][]byte, metaStart int64, tag uint32) []byte {
 // The 124-byte CHD v5 header. The SHA1 fields at 0x40 and 0x54 stay zero until the
 // hunks are written; parentsha1 at 0x68 stays zero, we never write parent chains.
 // https://github.com/mamedev/mame/blob/33c42e9e0e89c879e0fc5b654cc70b947bf1473c/src/lib/util/chd.cpp#L2606-L2624
-func makeHeader(totalLogical, mapOffset, metaOffset int64) []byte {
+func makeHeader(totalLogical, mapOffset, metaOffset int64, codec Codec) []byte {
 	h := make([]byte, headerSize)
 	copy(h[0x00:], headerMagic)
 	binary.BigEndian.PutUint32(h[0x08:], headerSize)
 	binary.BigEndian.PutUint32(h[0x0C:], chdVersion)
 	binary.BigEndian.PutUint32(h[headerCodecOffset:], codecCDZlib) // compressors[0]
 
-	// compressors[1..3] = 0 (only one codec needed)
+	if codec == CodecFLAC {
+		binary.BigEndian.PutUint32(h[headerCodecOffset+headerCodecSlotBytes:], codecCDFlac) // compressors[1]
+	}
+
 	//nolint:gosec // G115: sizes and file offsets are always non-negative
 	binary.BigEndian.PutUint64(h[0x20:], uint64(totalLogical))
 	//nolint:gosec // G115: sizes and file offsets are always non-negative

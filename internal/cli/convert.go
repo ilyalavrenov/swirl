@@ -10,6 +10,7 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/ilyalavrenov/swirl/internal/chd"
 	"github.com/ilyalavrenov/swirl/internal/convert"
 )
 
@@ -21,7 +22,11 @@ func convertCommand() *cli.Command {
 a directory for cue and gdi.
 
 The output format comes from the output extension, defaulting to gdi; --to
-overrides it. Supported: cue to gdi or chd, gdi to cue or chd, chd to cue.`,
+overrides it. Supported: cue to gdi or chd, gdi to cue or chd, chd to cue.
+
+--codec sets chd compression, spelled as chdman spells a codec set. The default
+cdzl,cdfl takes the smaller of deflate and FLAC on audio hunks; cdzl deflates
+everything, for a slightly faster write.`,
 		Arguments: []cli.Argument{
 			&cli.StringArg{Name: argInput},
 			&cli.StringArg{Name: argOutput},
@@ -35,6 +40,11 @@ overrides it. Supported: cue to gdi or chd, gdi to cue or chd, chd to cue.`,
 			&cli.BoolFlag{
 				Name:  flagForce,
 				Usage: "replace an existing output file or a non-empty output directory",
+			},
+			&cli.StringFlag{
+				Name:  flagCodec,
+				Usage: "chd compressor: `CODEC` is " + codecList(),
+				Value: string(chd.CodecFLAC),
 			},
 		},
 		Action: runConvert,
@@ -71,6 +81,11 @@ func runConvert(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("input and output are both %s, nothing to do", from)
 	}
 
+	codec, err := chd.ParseCodec(cmd.String(flagCodec))
+	if err != nil {
+		return err
+	}
+
 	asJSON := cmd.Bool(flagJSON)
 	if !asJSON {
 		fmt.Fprintf(cmd.Writer, "Converting %s\n", filepath.Base(inputPath))
@@ -80,6 +95,7 @@ func runConvert(ctx context.Context, cmd *cli.Command) error {
 
 	result, err := convert.Run(ctx, from, to, inputPath, outputArg, convert.Options{
 		Force:    cmd.Bool(flagForce),
+		Codec:    codec,
 		Progress: bars.step,
 	})
 
@@ -208,4 +224,13 @@ func parseFormat(s string) (convert.Format, error) {
 	default:
 		return "", fmt.Errorf("unknown format %q, want cue, gdi, or chd", s)
 	}
+}
+
+func codecList() string {
+	names := make([]string, 0, len(chd.Codecs()))
+	for _, c := range chd.Codecs() {
+		names = append(names, string(c))
+	}
+
+	return strings.Join(names, " or ")
 }

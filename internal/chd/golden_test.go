@@ -3,9 +3,11 @@ package chd
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -115,9 +117,14 @@ func TestChdmanReadsWhatWriteProduces(t *testing.T) {
 		t.Skip("chdman not installed: swirl's CHD is not being cross-checked")
 	}
 
-	audio := make([]byte, 8*sectorBytes)
-	for i := range audio {
-		audio[i] = byte(i*13 + 5)
+	// Two incommensurate tones: a FLAC predictor tracks them, deflate finds no repeat.
+	const audioFrames = 16
+
+	audio := make([]byte, audioFrames*sectorBytes)
+	for i := 0; i+audioSampleBytes <= len(audio); i += audioSampleBytes {
+		t := float64(i / audioSampleBytes)
+		v := 9000*math.Sin(t*0.011) + 7000*math.Sin(t*0.0037)
+		binary.LittleEndian.PutUint16(audio[i:], uint16(int16(v)))
 	}
 
 	// A B C A B A A drives every self-reference symbol the writer emits: a target spelled
@@ -137,34 +144,44 @@ func TestChdmanReadsWhatWriteProduces(t *testing.T) {
 	// Not 4-frame aligned, so a padded FRAMES would start the audio three sectors late.
 	const dataFrames = 5
 
-	repeatedFrames := len(repeated) / sectorBytes
+	for _, codec := range Codecs() {
+		t.Run(string(codec), func(t *testing.T) {
+			t.Parallel()
 
-	path := writeCHD(t, []Track{
-		makeTrack(1, "MODE1/2352", dataFrames, 0, 0x5A),
-		{Number: 2, Type: "AUDIO", Frames: 8, Data: bytes.NewReader(bytes.Clone(audio))},
-		{Number: 3, Type: "MODE1/2352", Frames: repeatedFrames, Data: bytes.NewReader(repeated)},
-	})
+			repeatedFrames := len(repeated) / sectorBytes
 
-	assert.Equal(t, 4, selfReferences(t, path), "A B C A B A A repeats four hunks")
+			path := writeCHDWith(t, []Track{
+				makeTrack(1, "MODE1/2352", dataFrames, 0, 0x5A),
+				{Number: 2, Type: "AUDIO", Frames: audioFrames, Data: bytes.NewReader(bytes.Clone(audio))},
+				{Number: 3, Type: "MODE1/2352", Frames: repeatedFrames, Data: bytes.NewReader(repeated)},
+			}, codec)
 
-	out, err := exec.CommandContext(t.Context(), chdman, "verify", "-i", path).CombinedOutput()
-	require.NoError(t, err, "chdman verify: %s", out)
-	assert.Contains(t, string(out), "Raw SHA1 verification successful")
-	assert.Contains(t, string(out), "Overall SHA1 verification successful")
+			assert.Equal(t, 4, selfReferences(t, path), "A B C A B A A repeats four hunks")
 
-	dir := t.TempDir()
-	out, err = exec.CommandContext(t.Context(), chdman,
-		"extractcd", "-i", path, "-o", filepath.Join(dir, "o.cue"), "-f").CombinedOutput()
-	require.NoError(t, err, "chdman extractcd: %s", out)
+			out, err := exec.CommandContext(t.Context(), chdman, "verify", "-i", path).CombinedOutput()
+			require.NoError(t, err, "chdman verify: %s", out)
+			assert.Contains(t, string(out), "Raw SHA1 verification successful")
+			assert.Contains(t, string(out), "Overall SHA1 verification successful")
 
-	// chdman concatenates a plain CD's tracks into one .bin.
-	got, err := os.ReadFile(filepath.Join(dir, "o.bin"))
-	require.NoError(t, err)
-	require.Len(t, got, (dataFrames+8+repeatedFrames)*sectorBytes, "chdman must see the real track lengths")
-	assert.Equal(t, audio, got[dataFrames*sectorBytes:(dataFrames+8)*sectorBytes],
-		"chdman must see the audio in the order the source had, at the sector it starts on")
-	assert.Equal(t, repeated, got[(dataFrames+8)*sectorBytes:],
-		"and must resolve every self-reference back to the bytes it stands for")
+			dir := t.TempDir()
+			out, err = exec.CommandContext(t.Context(), chdman,
+				"extractcd", "-i", path, "-o", filepath.Join(dir, "o.cue"), "-f").CombinedOutput()
+			require.NoError(t, err, "chdman extractcd: %s", out)
+
+			// chdman concatenates a plain CD's tracks into one .bin.
+			got, err := os.ReadFile(filepath.Join(dir, "o.bin"))
+			require.NoError(t, err)
+			require.Len(t, got, (dataFrames+audioFrames+repeatedFrames)*sectorBytes,
+				"chdman must see the real track lengths")
+			assert.Equal(t, audio, got[dataFrames*sectorBytes:(dataFrames+audioFrames)*sectorBytes],
+				"chdman must see the audio in the order the source had, at the sector it starts on")
+			assert.Equal(t, repeated, got[(dataFrames+audioFrames)*sectorBytes:],
+				"and must resolve every self-reference back to the bytes it stands for")
+
+			assert.Equal(t, codec == CodecFLAC, slices.Contains(hunkCodecs(t, path), "cdfl"),
+				"cdfl must win the audio hunks under cdzl,cdfl, and must not appear otherwise")
+		})
+	}
 }
 
 // testdata/golden-gdrom.chd is the same idea at GD-ROM scale: a 105 MB disc that

@@ -20,6 +20,7 @@ import (
 const (
 	flagTo    = "to"
 	flagForce = "force"
+	flagCodec = "codec"
 	flagJSON  = "json"
 
 	argInput  = "input"

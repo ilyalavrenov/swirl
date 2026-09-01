@@ -10,7 +10,9 @@ import (
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/mewkiz/flac"
 	flacframe "github.com/mewkiz/flac/frame"
+	"github.com/mewkiz/flac/meta"
 	"github.com/ulikunitz/xz/lzma"
 )
 
@@ -23,11 +25,15 @@ const (
 	// (pb*5 + lp)*9 + lc for the SDK defaults lc=3, lp=0, pb=2.
 	lzmaProps = 0x5D
 
-	// CD audio: 16-bit stereo.
+	// CD audio: 16-bit stereo at 44.1 kHz.
 	audioChannels      = 2
 	audioSampleBytes   = 2
 	audioBitsPerSample = 16
 	audioFrameBytes    = audioChannels * audioSampleBytes
+	audioSampleRate    = 44100
+
+	// chdman's block size; MAME's decoder rejects any other.
+	flacBlockSamples = 2352
 
 	// Far above any real hunk, but a bound: klauspost defaults to 64 GiB.
 	zstdMaxDecoded = 1 << 24
@@ -230,4 +236,68 @@ func decompressCDFL(data []byte, hunkBytes int) ([]byte, error) {
 	}
 
 	return assembleHunk(sectorData, subcodeData, nil, hunkBytes), nil
+}
+
+// Bare FLAC frames, no signature and no STREAMINFO, then the deflated subcode.
+func compressCDFLAC(hunkData []byte) ([]byte, error) {
+	sectorData, subcodeData := splitHunk(hunkData)
+
+	var buf bytes.Buffer
+
+	enc, err := flac.NewEncoder(&buf, &meta.StreamInfo{
+		BlockSizeMin:  flacBlockSamples,
+		BlockSizeMax:  flacBlockSamples,
+		SampleRate:    audioSampleRate,
+		NChannels:     audioChannels,
+		BitsPerSample: audioBitsPerSample,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("flac init: %w", err)
+	}
+
+	buf.Reset() // drop the stream header the encoder just wrote
+
+	for off := 0; off < len(sectorData); off += flacBlockSamples * audioFrameBytes {
+		if err := enc.WriteFrame(flacFrame(sectorData[off:])); err != nil {
+			return nil, fmt.Errorf("flac frame at byte %d: %w", off, err)
+		}
+	}
+
+	subcodeCmp, err := zlibCompress(subcodeData)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(buf.Bytes(), subcodeCmp...), nil
+}
+
+// CHD stores CD audio big-endian.
+func flacFrame(sectorData []byte) *flacframe.Frame {
+	// PredVerbatim asks the encoder to pick a predictor; the zero value claims constant samples.
+	newSubframe := func() *flacframe.Subframe {
+		return &flacframe.Subframe{
+			Pred:     flacframe.PredVerbatim,
+			Samples:  make([]int32, flacBlockSamples),
+			NSamples: flacBlockSamples,
+		}
+	}
+
+	left, right := newSubframe(), newSubframe()
+
+	for i := range flacBlockSamples {
+		off := i * audioFrameBytes
+		//nolint:gosec // G115: reinterpreting the sample's bits, the value is already 16-bit
+		left.Samples[i] = int32(int16(binary.BigEndian.Uint16(sectorData[off:])))
+		//nolint:gosec // G115: reinterpreting the sample's bits, the value is already 16-bit
+		right.Samples[i] = int32(int16(binary.BigEndian.Uint16(sectorData[off+audioSampleBytes:])))
+	}
+
+	return &flacframe.Frame{
+		HasFixedBlockSize: true,
+		BlockSize:         flacBlockSamples,
+		SampleRate:        audioSampleRate,
+		Channels:          flacframe.ChannelsLeftSide,
+		BitsPerSample:     audioBitsPerSample,
+		Subframes:         []*flacframe.Subframe{left, right},
+	}
 }
