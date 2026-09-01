@@ -26,6 +26,12 @@ type MSF struct {
 	Min, Sec, Frame int
 }
 
+// FramesAsMSF renders a frame count as the timecode a cue sheet carries.
+func FramesAsMSF(frames int) string {
+	return fmt.Sprintf("%02d:%02d:%02d",
+		frames/(framesPerSec*secsPerMin), frames/framesPerSec%secsPerMin, frames%framesPerSec)
+}
+
 type Track struct {
 	Number  int
 	Type    string // e.g. "MODE1/2352", "AUDIO"

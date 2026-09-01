@@ -134,10 +134,11 @@ func ParseCodec(s string) (Codec, error) {
 }
 
 type Track struct {
-	Number int
-	Type   string // CUE type: "MODE1/2352", "AUDIO", etc.
-	Frames int    // total frames in source file (including any pregap)
-	Pregap int    // pregap frames (INDEX 00 → INDEX 01 difference)
+	Number         int
+	Type           string // CUE type: "MODE1/2352", "AUDIO", etc.
+	Frames         int    // total frames in source file (including any pregap)
+	Pregap         int    // pregap frames (INDEX 00 → INDEX 01 difference)
+	TrailingPregap int    // the next track's pregap, which precedes it on the disc; Data supplies it
 
 	// StoredFrames pads the GD-ROM bridge track so the tracks before track 3 sum to
 	// exactly 45000 slots, which FillGDSession()'s fixed StartFAD of 45150 assumes.
@@ -152,7 +153,7 @@ func effectiveFrames(t Track) int {
 		return t.StoredFrames
 	}
 
-	return PadFrames(t.Frames)
+	return PadFrames(t.Frames + t.TrailingPregap)
 }
 
 // Sizes a progress indicator before Write runs.
@@ -299,6 +300,26 @@ type hunkStream struct {
 	frameInTrack int
 }
 
+// Alignment sits before the pregap, keeping it flush against the track it introduces.
+func (s *hunkStream) inTrailingPregap() bool {
+	t := s.tracks[s.trackIdx]
+
+	return t.TrailingPregap > 0 && s.frameInTrack >= effectiveFrames(t)-t.TrailingPregap
+}
+
+func (s *hunkStream) framedFromFile() bool {
+	return s.frameInTrack < s.tracks[s.trackIdx].Frames || s.inTrailingPregap()
+}
+
+// A trailing pregap is the next track's data, so its byte order follows that track.
+func (s *hunkStream) frameIsAudio() bool {
+	if s.inTrailingPregap() && s.trackIdx+1 < len(s.tracks) {
+		return disc.IsAudio(s.tracks[s.trackIdx+1].Type)
+	}
+
+	return disc.IsAudio(s.tracks[s.trackIdx].Type)
+}
+
 func (s *hunkStream) next() (hunk, error) {
 	h := hunk{data: make([]byte, hunkBytes)}
 	buf := h.data
@@ -309,13 +330,13 @@ func (s *hunkStream) next() (hunk, error) {
 			s.trackIdx++
 		}
 
-		if s.trackIdx < len(s.tracks) && s.frameInTrack < s.tracks[s.trackIdx].Frames {
+		if s.trackIdx < len(s.tracks) && s.framedFromFile() {
 			off := slot * slotBytes
 			if _, err := io.ReadFull(s.tracks[s.trackIdx].Data, buf[off:off+sectorBytes]); err != nil {
 				return hunk{}, fmt.Errorf("track %d frame %d: %w", s.tracks[s.trackIdx].Number, s.frameInTrack, err)
 			}
 
-			if disc.IsAudio(s.tracks[s.trackIdx].Type) {
+			if s.frameIsAudio() {
 				swapAudio(buf[off : off+sectorBytes])
 
 				h.audio = true
