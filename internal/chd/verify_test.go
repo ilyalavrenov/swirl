@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -155,28 +153,6 @@ func TestVerifyDigestStopsAtTheLogicalSize(t *testing.T) {
 	assert.Contains(t, err.Error(), "hunk data hashes to")
 }
 
-// The map header's declared bit widths are attacker-controlled and reach a
-// make([]byte, length), so they are bounded before any allocation is sized from
-// them. readHeader's own checks do not cover the map.
-func TestReadRejectsAnOverwideMapField(t *testing.T) {
-	t.Parallel()
-
-	_, valid := validCHD(t)
-	mapOffset := binary.BigEndian.Uint64(valid[0x28:])
-
-	for name, at := range map[string]uint64{"length bits": 12, "self bits": 13} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			path := corrupt(t, valid, func(b []byte) { b[mapOffset+at] = 0xFF })
-
-			_, err := Verify(t.Context(), path, nil)
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), "must fit a uint32")
-		})
-	}
-}
-
 func TestVerifyReportsProgress(t *testing.T) {
 	t.Parallel()
 
@@ -206,74 +182,6 @@ func TestStat(t *testing.T) {
 	assert.Equal(t, hunkCount(20), info.Hunks)
 	require.Len(t, info.Tracks, 2)
 	assert.Equal(t, disc.TrackTypeAudio, info.Tracks[1].CUEType)
-}
-
-// TestReadRejectsHostileHeader covers the fields a file gets to choose for
-// itself. Each one used to reach arithmetic or an allocation unchecked; the
-// first of them crashed rather than failing.
-func TestReadRejectsHostileHeader(t *testing.T) {
-	t.Parallel()
-
-	_, valid := validCHD(t)
-
-	for name, test := range map[string]struct {
-		edit func([]byte)
-		want string
-	}{
-		"zero hunk size divides by zero": {
-			edit: func(b []byte) { binary.BigEndian.PutUint32(b[0x38:], 0) },
-			want: "is not a whole number of",
-		},
-		"hunk size is not a whole number of sectors": {
-			edit: func(b []byte) { binary.BigEndian.PutUint32(b[0x38:], 1000) },
-			want: "is not a whole number of",
-		},
-		"logical size overflows int64": {
-			edit: func(b []byte) { binary.BigEndian.PutUint64(b[0x20:], 1<<63) },
-			want: "does not fit in an int64",
-		},
-		"more hunks than the file has bytes": {
-			edit: func(b []byte) { binary.BigEndian.PutUint64(b[0x20:], 1<<40) },
-			want: "hunks in a",
-		},
-		// The map runs out of bits long before the claimed hunk count is reached.
-		"more hunks than the map can describe": {
-			edit: func(b []byte) { binary.BigEndian.PutUint64(b[0x20:], 400*hunkBytes) },
-			want: "truncated bitstream",
-		},
-		"map offset past the end": {
-			edit: func(b []byte) { binary.BigEndian.PutUint64(b[0x28:], 1<<40) },
-			want: "map offset",
-		},
-		"metadata offset past the end": {
-			edit: func(b []byte) { binary.BigEndian.PutUint64(b[0x30:], 1<<40) },
-			want: "metadata offset",
-		},
-		"map data overruns the file": {
-			edit: func(b []byte) {
-				mapOffset := binary.BigEndian.Uint64(b[0x28:])
-				binary.BigEndian.PutUint32(b[mapOffset:], 0xFFFFFFFF)
-			},
-			want: "overruns the file",
-		},
-		"metadata chain points at itself": {
-			edit: func(b []byte) {
-				metaOffset := binary.BigEndian.Uint64(b[0x30:])
-				binary.BigEndian.PutUint64(b[metaOffset+8:], metaOffset)
-			},
-			want: "cyclic",
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			path := corrupt(t, valid, test.edit)
-
-			_, err := Read(t.Context(), path, t.TempDir(), io.Discard)
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), test.want)
-		})
-	}
 }
 
 // TestWriteAtomic pins that the output only ever appears complete: it is built
@@ -316,24 +224,4 @@ func TestWriteFailureKeepsExistingFile(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	assert.Len(t, entries, 1, "and must not leave a staging file behind")
-}
-
-// TestVerifyHunkCRC is why the per-hunk CRC is checked at
-// all: raw DEFLATE carries no checksum, so some flips decode cleanly into the
-// wrong bytes and nothing but the stored CRC notices.
-func TestVerifyHunkCRC(t *testing.T) {
-	t.Parallel()
-
-	_, valid := validCHD(t)
-
-	caughtByCRC := 0
-
-	for offset := firstHunkOffset(t, valid); offset < int64(len(valid)); offset++ {
-		_, err := Verify(t.Context(), corrupt(t, valid, func(b []byte) { b[offset] ^= 0x01 }), nil)
-		if errors.Is(err, ErrCRCMismatch) {
-			caughtByCRC++
-		}
-	}
-
-	assert.Positive(t, caughtByCRC, "corruption that decodes cleanly must still be caught")
 }

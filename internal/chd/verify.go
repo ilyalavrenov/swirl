@@ -118,13 +118,14 @@ func Verify(ctx context.Context, path string, progress io.Writer) (VerifyReport,
 	rawHash := sha1.New() //nolint:gosec // SHA1 is required by the CHD v5 format
 
 	remaining := c.header.logicalBytes
+	cache := &hunkCache{}
 
 	for hunkIdx := range c.records {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return VerifyReport{}, fmt.Errorf("verify %s: %w", path, ctxErr)
 		}
 
-		raw, hunkErr := readHunk(c.f, c.header, c.records, hunkIdx)
+		raw, hunkErr := readHunk(c.f, c.header, c.records, hunkIdx, cache)
 		if hunkErr != nil {
 			return VerifyReport{}, fmt.Errorf("%s: hunk %d: %w", path, hunkIdx, hunkErr)
 		}
@@ -181,7 +182,7 @@ func FirstSector(path string) ([]byte, error) {
 	}
 	defer c.close()
 
-	raw, err := readHunk(c.f, c.header, c.records, 0)
+	raw, err := readHunk(c.f, c.header, c.records, 0, &hunkCache{})
 	if err != nil {
 		return nil, fmt.Errorf("%s: hunk 0: %w", path, err)
 	}

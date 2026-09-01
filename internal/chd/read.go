@@ -275,13 +275,14 @@ func extractHunks(
 	progress io.Writer,
 ) error {
 	framesInHunk := h.hunkBytes / slotBytes
+	cache := &hunkCache{}
 
 	for hunkIdx := range records {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
 
-		raw, err := readHunk(f, h, records, hunkIdx)
+		raw, err := readHunk(f, h, records, hunkIdx, cache)
 
 		if err != nil {
 			return fmt.Errorf("hunk %d: %w", hunkIdx, err)
@@ -699,16 +700,42 @@ func decodeHuffmanSym(br *bitReader, codes []huffmanCodeEntry) (int, error) {
 	return 0, errors.New("no matching Huffman code")
 }
 
+// Holds the last hunk a self-reference resolved to. chdman points every duplicate hunk at
+// one stored copy, so a disc with a lot of silence asks for the same hunk thousands of times.
+type hunkCache struct {
+	idx int
+	raw []byte
+}
+
 // Resolves a self-reference to the hunk holding the data, then checks the map's CRC,
 // so a hunk that decompresses cleanly into the wrong bytes cannot reach a caller.
-func readHunk(f *os.File, h fileHeader, records []mapReadRecord, idx int) ([]byte, error) {
+func readHunk(f *os.File, h fileHeader, records []mapReadRecord, idx int, cache *hunkCache) ([]byte, error) {
+	duplicate := false
+
 	for range maxSelfChain {
 		rec := records[idx]
 		if rec.selfHunk < 0 {
-			return readStoredHunk(f, h, rec)
+			// Callers byte-swap audio in place, so a hit cannot hand out the cached buffer.
+			if cache.raw != nil && cache.idx == idx {
+				return bytes.Clone(cache.raw), nil
+			}
+
+			raw, err := readStoredHunk(f, h, rec)
+			if err != nil {
+				return nil, err
+			}
+
+			// Caching only what a reference reached keeps an all-distinct disc from paying
+			// for copies nothing reads back.
+			if duplicate {
+				cache.idx, cache.raw = idx, bytes.Clone(raw)
+			}
+
+			return raw, nil
 		}
 
 		idx = rec.selfHunk
+		duplicate = true
 	}
 
 	return nil, errors.New("self-references form a cycle")
