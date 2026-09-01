@@ -18,10 +18,12 @@ import (
 )
 
 const (
-	flagTo    = "to"
-	flagForce = "force"
-	flagCodec = "codec"
-	flagJSON  = "json"
+	flagTo     = "to"
+	flagForce  = "force"
+	flagCodec  = "codec"
+	flagJSON   = "json"
+	flagDAT    = "dat"
+	flagRedump = "redump"
 
 	argInput  = "input"
 	argOutput = "output"

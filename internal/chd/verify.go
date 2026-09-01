@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1" //nolint:gosec // SHA1 is required by the CHD v5 format
 	"fmt"
+	"hash"
 	"io"
 	"os"
 )
@@ -99,6 +100,7 @@ type VerifyReport struct {
 	LogicalBytes int64
 	RawSHA1      []byte
 	CombinedSHA1 []byte
+	TrackSHA1    [][]byte
 }
 
 // Verify decompresses every hunk, CRC-checks it, and recomputes both header digests.
@@ -116,6 +118,7 @@ func Verify(ctx context.Context, path string, progress io.Writer) (VerifyReport,
 	defer c.close()
 
 	rawHash := sha1.New() //nolint:gosec // SHA1 is required by the CHD v5 format
+	trackHashes := newTrackHashes(c.tracks)
 
 	remaining := c.header.logicalBytes
 
@@ -133,6 +136,10 @@ func Verify(ctx context.Context, path string, progress io.Writer) (VerifyReport,
 
 		rawHash.Write(raw)
 		progress.Write(raw) //nolint:errcheck // progress reporting never affects the result
+
+		if hashErr := trackHashes.writeHunk(raw); hashErr != nil {
+			return VerifyReport{}, hashErr
+		}
 	}
 
 	raw := rawHash.Sum(nil)
@@ -152,7 +159,36 @@ func Verify(ctx context.Context, path string, progress io.Writer) (VerifyReport,
 		LogicalBytes: c.header.logicalBytes,
 		RawSHA1:      raw,
 		CombinedSHA1: combined,
+		TrackSHA1:    trackHashes.sums(),
 	}, nil
+}
+
+// Rides along on Verify's hunk walk; a second pass would decompress the disc again.
+type trackHasher struct {
+	*trackWriter
+
+	hashes []hash.Hash
+}
+
+func newTrackHashes(tracks []TrackInfo) *trackHasher {
+	hashes := make([]hash.Hash, len(tracks))
+	sinks := make([]io.Writer, len(tracks))
+
+	for i := range tracks {
+		hashes[i] = sha1.New() //nolint:gosec // SHA1 is what redump records
+		sinks[i] = hashes[i]
+	}
+
+	return &trackHasher{trackWriter: newTrackWriter(tracks, sinks), hashes: hashes}
+}
+
+func (t *trackHasher) sums() [][]byte {
+	sums := make([][]byte, len(t.hashes))
+	for i, h := range t.hashes {
+		sums[i] = h.Sum(nil)
+	}
+
+	return sums
 }
 
 // Only entries flagged CHD_MDFLAGS_CHECKSUM contribute to the digest.
