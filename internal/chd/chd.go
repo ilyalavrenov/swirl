@@ -44,8 +44,7 @@ const (
 	mapCompType3 = 3
 	mapCompNone  = 4
 
-	// Read-side only; chdman emits these. SELF names an earlier identical hunk, RLE
-	// repeats the previous type, PARENT points into a parent CHD (unsupported).
+	// RLE and PARENT are read-side only; chdman emits them.
 	mapCompSelf       = 5
 	mapCompParent     = 6
 	mapCompRLESmall   = 7
@@ -86,8 +85,10 @@ const (
 
 	huffmanRLEBitWidth = 4
 
-	// 11 zero-length symbols; the count is stored as N-3.
-	huffmanRLECount11 = 8
+	// The writer's fixed map tree: a compressed hunk in one bit, the four other symbols it
+	// emits in three.
+	mapCommonCodeBits = 1
+	mapOtherCodeBits  = 3
 
 	crcInitValue  = 0xFFFF
 	crcHighBit    = 0x8000
@@ -145,9 +146,10 @@ func hunkCount(frames int) int {
 }
 
 type hunkRecord struct {
-	compType uint8 // mapCompType0 or mapCompNone
+	compType uint8 // mapCompType0, mapCompNone or mapCompSelf
 	length   uint32
 	rawCRC   uint16 // CRC16-CCITT of the uncompressed hunk
+	selfHunk int    // the identical earlier hunk, when compType is mapCompSelf
 }
 
 type layout struct {
@@ -206,6 +208,7 @@ func compressHunks(
 	records := make([]hunkRecord, l.numHunks)
 	rawHash := sha1.New() //nolint:gosec // SHA1 is required by the CHD v5 format
 	stream := &hunkStream{tracks: tracks}
+	seen := make(map[[sha1.Size]byte]int, l.numHunks)
 
 	workers := runtime.NumCPU()
 	batch := make([][]byte, 0, workers)
@@ -216,7 +219,7 @@ func compressHunks(
 			return nil
 		}
 
-		if err := compressBatch(tmp, records, batchStart, batch); err != nil {
+		if err := compressBatch(tmp, records, batchStart, batch, seen); err != nil {
 			return err
 		}
 
@@ -288,9 +291,10 @@ func (s *hunkStream) next() ([]byte, error) {
 }
 
 // Compresses in parallel, writes in stream order, so layout never depends on timing.
-func compressBatch(w io.Writer, records []hunkRecord, start int, batch [][]byte) error {
+func compressBatch(w io.Writer, records []hunkRecord, start int, batch [][]byte, seen map[[sha1.Size]byte]int) error {
 	type result struct {
 		stored   []byte
+		digest   [sha1.Size]byte
 		compType uint8
 		rawCRC   uint16
 		err      error
@@ -309,7 +313,12 @@ func compressBatch(w io.Writer, records []hunkRecord, start int, batch [][]byte)
 				return
 			}
 
-			results[i] = result{stored: compressed, compType: mapCompType0, rawCRC: crc16CCITT(raw)}
+			results[i] = result{
+				stored:   compressed,
+				digest:   sha1.Sum(raw), //nolint:gosec // G401: names a hunk's content, nothing security rests on it
+				compType: mapCompType0,
+				rawCRC:   crc16CCITT(raw),
+			}
 			if len(compressed) >= len(raw) {
 				results[i].stored, results[i].compType = raw, mapCompNone
 			}
@@ -322,6 +331,14 @@ func compressBatch(w io.Writer, records []hunkRecord, start int, batch [][]byte)
 		if r.err != nil {
 			return fmt.Errorf("compress hunk %d: %w", start+i, r.err)
 		}
+
+		if src, dup := seen[r.digest]; dup {
+			records[start+i] = hunkRecord{compType: mapCompSelf, selfHunk: src}
+
+			continue
+		}
+
+		seen[r.digest] = start + i
 
 		if _, err := w.Write(r.stored); err != nil {
 			return fmt.Errorf("write hunk %d to temp: %w", start+i, err)
@@ -349,7 +366,14 @@ func assemble(outputPath string, hunks io.Reader, l layout, records []hunkRecord
 	}
 
 	mapOffset := metaStart + metaLen
-	mapData := encodeMap(records, l.numHunks)
+
+	types, selfBits := promoteSelf(records)
+
+	mapData, err := encodeMap(records, types, selfBits)
+	if err != nil {
+		return err
+	}
+
 	mapLen := int64(mapHeaderBytes + len(mapData))
 	dataStart := alignUp(mapOffset+mapLen, hunkBytes)
 	firstOffset := uint64(dataStart) //nolint:gosec // G115: sizes and file offsets are always non-negative
@@ -371,7 +395,7 @@ func assemble(outputPath string, hunks io.Reader, l layout, records []hunkRecord
 	}{
 		{"header", makeHeader(int64(l.numHunks)*hunkBytes, mapOffset, metaStart)},
 		{"metadata", buildMetaBytes(l.metaTexts, metaStart, l.metaTag)},
-		{"map header", buildMapHeader(mapData, firstOffset, records, l.numHunks)},
+		{"map header", buildMapHeader(mapData, firstOffset, records, selfBits)},
 		{"map", mapData},
 		{"padding", make([]byte, dataStart-(mapOffset+mapLen))},
 	}
@@ -516,54 +540,112 @@ func zlibCompress(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// The Huffman+RLE map data, without its 16-byte header. The tree is fixed: symbol 0
-// (CDZLIB) is code 0 and symbol 4 (uncompressed) is code 1, one bit each.
-func encodeMap(records []hunkRecord, numHunks int) []byte {
-	bw := &bitWriter{}
+// The tree the map's type stream is coded against, as 16 four-bit code lengths.
+func mapCodeLengths() []int {
+	lengths := make([]int, huffmanNumSymbols)
+	lengths[mapCompType0] = mapCommonCodeBits
 
-	// Tree RLE, escape=1: a literal bit-length of 1 is "1 1", and N reps of a value v
-	// other than 1 is "1 v (N-3)", with N at least 3.
-	// symbol 0: bit-length 1
-	bw.write(1, huffmanRLEBitWidth)
-	bw.write(1, huffmanRLEBitWidth)
-	// symbols 1-3: bit-length 0
-	bw.write(1, huffmanRLEBitWidth)
-	bw.write(0, huffmanRLEBitWidth)
-	bw.write(0, huffmanRLEBitWidth)
-	// symbol 4: bit-length 1
-	bw.write(1, huffmanRLEBitWidth)
-	bw.write(1, huffmanRLEBitWidth)
-	// symbols 5-15: bit-length 0
-	bw.write(1, huffmanRLEBitWidth)
-	bw.write(0, huffmanRLEBitWidth)
-	bw.write(huffmanRLECount11, huffmanRLEBitWidth)
-
-	for i := range numHunks {
-		if records[i].compType == mapCompNone {
-			bw.write(1, 1) // symbol 4 → code 1
-		} else {
-			bw.write(0, 1) // symbol 0 → code 0
-		}
+	for _, sym := range []int{mapCompNone, mapCompSelf, mapCompSelf0, mapCompSelf1} {
+		lengths[sym] = mapOtherCodeBits
 	}
 
-	for i := range numHunks {
-		if records[i].compType == mapCompType0 {
-			bw.write(records[i].length, lengthBits)
-		}
-		// Both types carry the 16-bit CRC of the decompressed hunk.
-		bw.write(uint32(records[i].rawCRC), mapCRCBits)
-	}
-
-	return bw.buf
+	return lengths
 }
 
-func buildMapHeader(mapData []byte, firstOffset uint64, records []hunkRecord, numHunks int) []byte {
-	entryData := make([]byte, numHunks*mapEntryBytes)
+// Promotes each self-reference to the symbol MAME's compress_v5_map would pick and
+// returns the width the remaining spelled-out targets need; diverging fails chdman verify.
+// https://github.com/mamedev/mame/blob/33c42e9e0e89c879e0fc5b654cc70b947bf1473c/src/lib/util/chd.cpp#L2239-L2250
+func promoteSelf(records []hunkRecord) ([]uint8, byte) {
+	types := make([]uint8, len(records))
+	lastSelf, maxSelf := 0, 0
+
+	for i, r := range records {
+		types[i] = r.compType
+		if r.compType != mapCompSelf {
+			continue
+		}
+
+		switch r.selfHunk {
+		case lastSelf:
+			types[i] = mapCompSelf0
+		case lastSelf + 1:
+			types[i] = mapCompSelf1
+		default:
+			maxSelf = max(maxSelf, r.selfHunk)
+		}
+
+		lastSelf = r.selfHunk
+	}
+
+	selfBits := byte(0)
+	for v := maxSelf; v > 0; v >>= 1 {
+		selfBits++
+	}
+
+	return types, selfBits
+}
+
+// The Huffman+RLE map data, without its 16-byte header.
+func encodeMap(records []hunkRecord, types []uint8, selfBits byte) ([]byte, error) {
+	lengths := mapCodeLengths()
+
+	codes, err := buildCanonicalCodes(lengths)
+	if err != nil {
+		return nil, err
+	}
+
+	bySym := make(map[int]huffmanCodeEntry, len(codes))
+	for _, c := range codes {
+		bySym[c.sym] = c
+	}
+
+	bw := &bitWriter{}
+
+	// Tree RLE, escape=1: a literal bit-length of 1 is "1 1", anything else is itself.
+	for _, l := range lengths {
+		if l == 1 {
+			bw.write(1, huffmanRLEBitWidth)
+		}
+
+		bw.write(uint32(l), huffmanRLEBitWidth) //nolint:gosec // G115: a code length is under 16
+	}
+
+	for _, t := range types {
+		c := bySym[int(t)]
+		bw.write(c.code, c.length)
+	}
+
+	for i, t := range types {
+		switch t {
+		case mapCompType0:
+			bw.write(records[i].length, lengthBits)
+			bw.write(uint32(records[i].rawCRC), mapCRCBits)
+		case mapCompNone:
+			bw.write(uint32(records[i].rawCRC), mapCRCBits)
+		case mapCompSelf:
+			bw.write(uint32(records[i].selfHunk), int(selfBits)) //nolint:gosec // G115: a hunk index is non-negative
+		}
+	}
+
+	return bw.buf, nil
+}
+
+func buildMapHeader(mapData []byte, firstOffset uint64, records []hunkRecord, selfBits byte) []byte {
+	entryData := make([]byte, len(records)*mapEntryBytes)
 	curOffset := firstOffset
 
 	for i, r := range records {
 		off := i * mapEntryBytes
 		entryData[off] = r.compType
+
+		// The CRC below is taken over references normalized back to plain SELF: the target
+		// hunk where the offset goes, no length, no CRC.
+		if r.compType == mapCompSelf {
+			putUint48BE(entryData[off+4:], uint64(r.selfHunk)) //nolint:gosec // G115: a hunk index is non-negative
+
+			continue
+		}
+
 		putUint24BE(entryData[off+1:], r.length)
 		putUint48BE(entryData[off+4:], curOffset)
 		binary.BigEndian.PutUint16(entryData[off+10:], r.rawCRC)
@@ -575,7 +657,8 @@ func buildMapHeader(mapData []byte, firstOffset uint64, records []hunkRecord, nu
 	putUint48BE(h[4:], firstOffset)
 	binary.BigEndian.PutUint16(h[10:], crc16CCITT(entryData))
 	h[12] = lengthBits // bits used to encode compressed lengths
-	// h[13] selfBits = 0, h[14] parentBits = 0, h[15] reserved = 0
+	h[13] = selfBits
+	// h[14] parentBits = 0, h[15] reserved = 0
 
 	return h
 }

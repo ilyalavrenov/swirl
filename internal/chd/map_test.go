@@ -9,8 +9,8 @@ import (
 
 // mapStream builds a compressed-map bitstream: a Huffman tree giving eight
 // symbols a 3-bit code each, then the symbols themselves. Write never emits the
-// run-length or self-reference symbols, so nothing in this package produces a map
-// that exercises them and they have to be assembled by hand.
+// run-length symbols, so nothing in this package produces a map that exercises
+// them and they have to be assembled by hand.
 func mapStream(t *testing.T, syms ...int) (*bitReader, []huffmanCodeEntry) {
 	t.Helper()
 
@@ -123,6 +123,30 @@ func TestReadMapEntriesWalksSelfTargets(t *testing.T) {
 	}
 
 	assert.Equal(t, []int{1, 1, 2, 3}, got)
+}
+
+func TestPromoteSelfPicksTheCompactSymbol(t *testing.T) {
+	t.Parallel()
+
+	self := func(target int) hunkRecord {
+		return hunkRecord{compType: mapCompSelf, selfHunk: target}
+	}
+
+	types, selfBits := promoteSelf([]hunkRecord{
+		{compType: mapCompType0},
+		{compType: mapCompNone},
+		self(0), // where the running target starts
+		self(1),
+		self(7),
+		self(8),
+		self(8),
+	})
+
+	assert.Equal(t, []uint8{
+		mapCompType0, mapCompNone,
+		mapCompSelf0, mapCompSelf1, mapCompSelf, mapCompSelf1, mapCompSelf0,
+	}, types)
+	assert.Equal(t, byte(3), selfBits, "hunk 7 is the only target written out; 8 never is")
 }
 
 func TestReadMapEntriesRejectsParentReferences(t *testing.T) {
