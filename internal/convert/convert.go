@@ -89,7 +89,9 @@ func Run(ctx context.Context, from, to Format, inputPath, outputPath string, opt
 	case from == FormatGDI && to == FormatCHD:
 		return gdiToCHD(ctx, inputPath, outputPath, opts)
 	case from == FormatCHD && to == FormatCUE:
-		return chdToCUE(ctx, inputPath, outputPath, opts)
+		return chdToSheet(ctx, inputPath, outputPath, "disc.cue", cueSheetFor, opts)
+	case from == FormatCHD && to == FormatGDI:
+		return chdToSheet(ctx, inputPath, outputPath, "disc.gdi", gdiSheetFor, opts)
 	default:
 		return Result{}, fmt.Errorf("converting %s to %s is not supported", from, to)
 	}
@@ -144,13 +146,7 @@ func cueToGDI(ctx context.Context, cuePath, outputDir string, opts Options) (Res
 
 		totalBytes += written
 
-		gdiType := gdi.TrackTypeData
-		if disc.IsAudio(t.Type) {
-			gdiType = gdi.TrackTypeAudio
-		}
-
-		lines = append(lines, fmt.Sprintf("%d %d %d %d %s 0 ",
-			t.Number, t.StartLBA, gdiType, disc.SectorBytes, dstName))
+		lines = append(lines, gdiLine(t.Number, t.StartLBA, t.Type, dstName))
 	}
 
 	if err := writeSheet(out.path("disc.gdi"), lines); err != nil {
@@ -230,7 +226,12 @@ func gdiToCUE(ctx context.Context, gdiPath, outputDir string, opts Options) (Res
 	return Result{Path: filepath.Join(outputDir, "disc.cue"), Tracks: total, Bytes: totalBytes}, nil
 }
 
-func chdToCUE(ctx context.Context, chdPath, outputDir string, opts Options) (Result, error) {
+func chdToSheet(
+	ctx context.Context,
+	chdPath, outputDir, sheetName string,
+	sheetFor func([]chd.TrackInfo) []string,
+	opts Options,
+) (Result, error) {
 	size, err := chd.LogicalBytes(chdPath)
 	if err != nil {
 		return Result{}, err
@@ -254,7 +255,7 @@ func chdToCUE(ctx context.Context, chdPath, outputDir string, opts Options) (Res
 		totalBytes += int64(t.RealFrames) * disc.SectorBytes
 	}
 
-	if err := writeSheet(out.path("disc.cue"), cueSheetFor(tracks)); err != nil {
+	if err := writeSheet(out.path(sheetName), sheetFor(tracks)); err != nil {
 		return Result{}, err
 	}
 
@@ -262,7 +263,7 @@ func chdToCUE(ctx context.Context, chdPath, outputDir string, opts Options) (Res
 		return Result{}, err
 	}
 
-	return Result{Path: filepath.Join(outputDir, "disc.cue"), Tracks: len(tracks), Bytes: totalBytes}, nil
+	return Result{Path: filepath.Join(outputDir, sheetName), Tracks: len(tracks), Bytes: totalBytes}, nil
 }
 
 func cueToCHD(ctx context.Context, cuePath, outputPath string, opts Options) (Result, error) {
@@ -384,7 +385,9 @@ func padBridge(tracks []chd.Track, idx int) {
 		sumPrev += chd.PadFrames(t.Frames)
 	}
 
-	if required := disc.HDAStartLBA - sumPrev; required > tracks[idx].Frames {
+	// >=, not >: StoredFrames doubles as the CHGD tag, and a GD-ROM read as CHT2 has its
+	// sector addressing shifted.
+	if required := disc.HDAStartLBA - sumPrev; required >= tracks[idx].Frames {
 		tracks[idx].StoredFrames = required
 	}
 }
@@ -406,6 +409,31 @@ func cueSheetFor(tracks []chd.TrackInfo) []string {
 	}
 
 	return lines
+}
+
+// Start LBAs advance by TotalFrames, not RealFrames: bridge padding is sectors too.
+func gdiSheetFor(tracks []chd.TrackInfo) []string {
+	lines := make([]string, 0, len(tracks)+1)
+	lines = append(lines, strconv.Itoa(len(tracks)))
+
+	startLBA := 0
+
+	for _, t := range tracks {
+		lines = append(lines, gdiLine(t.Number, startLBA, t.CUEType, disc.TrackFileName(t.Number, t.CUEType)))
+		startLBA += t.TotalFrames
+	}
+
+	return lines
+}
+
+// Trailing zero is the in-file offset, always 0 once pregaps are stripped.
+func gdiLine(number, startLBA int, cueType, filename string) string {
+	trackType := gdi.TrackTypeData
+	if disc.IsAudio(cueType) {
+		trackType = gdi.TrackTypeAudio
+	}
+
+	return fmt.Sprintf("%d %d %d %d %s 0 ", number, startLBA, trackType, disc.SectorBytes, filename)
 }
 
 func cueStanza(number int, cueType, filename string) []string {

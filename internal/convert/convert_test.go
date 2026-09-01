@@ -319,6 +319,26 @@ func TestGDIToCHD(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(outputDir, "track02.raw"))
 	require.NoError(t, err)
 	assert.Equal(t, bytes.Repeat([]byte{0x22}, 8*disc.SectorBytes), got)
+
+	t.Run("back to gdi", func(t *testing.T) {
+		t.Parallel()
+
+		gdiDir := filepath.Join(t.TempDir(), "restored")
+
+		back, err := convert.Run(t.Context(), convert.FormatCHD, convert.FormatGDI, chdPath, gdiDir, convert.Options{})
+		require.NoError(t, err)
+		assert.Equal(t, 2, back.Tracks)
+
+		assert.Equal(t, []string{
+			"2",
+			"1 0 4 2352 track01.bin 0 ",
+			"2 8 0 2352 track02.raw 0 ",
+		}, lines(t, filepath.Join(gdiDir, "disc.gdi")), "the track table survives the archive")
+
+		audio, err := os.ReadFile(filepath.Join(gdiDir, "track02.raw"))
+		require.NoError(t, err)
+		assert.Equal(t, bytes.Repeat([]byte{0x22}, 8*disc.SectorBytes), audio)
+	})
 }
 
 // TestChdToCueNoHighDensityMarker is a regression test: an ordinary CD must not
@@ -404,7 +424,7 @@ func TestRunRefusesExistingOutputFile(t *testing.T) {
 func TestRunUnsupportedConversion(t *testing.T) {
 	t.Parallel()
 
-	_, err := convert.Run(t.Context(), convert.FormatCHD, convert.FormatGDI, "in.chd", t.TempDir(), convert.Options{})
+	_, err := convert.Run(t.Context(), convert.Format("iso"), convert.FormatGDI, "in.iso", t.TempDir(), convert.Options{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not supported")
 }

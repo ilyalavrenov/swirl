@@ -22,11 +22,12 @@ func convertCommand() *cli.Command {
 a directory for cue and gdi.
 
 The output format comes from the output extension, defaulting to gdi; --to
-overrides it. Supported: cue to gdi or chd, gdi to cue or chd, chd to cue.
+overrides it. Supported: cue to gdi or chd, gdi to cue or chd, chd to cue or gdi.
 
 --codec sets chd compression, spelled as chdman spells a codec set. The default
 cdzl,cdfl takes the smaller of deflate and FLAC on audio hunks; cdzl deflates
 everything, for a slightly faster write.`,
+
 		Arguments: []cli.Argument{
 			&cli.StringArg{Name: argInput},
 			&cli.StringArg{Name: argOutput},

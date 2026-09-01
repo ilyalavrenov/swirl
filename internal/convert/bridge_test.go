@@ -151,6 +151,19 @@ func TestPadBridge(t *testing.T) {
 	assert.Equal(t, want, tracks[1].StoredFrames, "the bridge fills the gap up to the high-density boundary")
 	assert.Zero(t, tracks[0].StoredFrames, "tracks either side are untouched")
 	assert.Zero(t, tracks[2].StoredFrames)
+
+	// StoredFrames doubles as the CHGD tag, so an exact-fit bridge still has to be set.
+	t.Run("bridge already on the boundary", func(t *testing.T) {
+		t.Parallel()
+
+		const head = 300
+
+		exact := []chd.Track{{Number: 1, Frames: head}, {Number: 2, Frames: disc.HDAStartLBA - head}}
+
+		padBridge(exact, 1)
+
+		assert.Equal(t, disc.HDAStartLBA-head, exact[1].StoredFrames)
+	})
 }
 
 func TestPadBridgeSkipsLongEnoughTrack(t *testing.T) {
@@ -187,6 +200,24 @@ func TestCueSheetForGDROM(t *testing.T) {
 	require.Contains(t, got, hdaRem)
 	assert.Equal(t, `FILE "track03.bin" BINARY`, got[len(got)-3], "the marker sits immediately before track 3")
 	assert.Equal(t, hdaRem, got[len(got)-4])
+}
+
+// Bridge padding shows up in the next track's start LBA, nowhere else.
+func TestGDISheetForGDROM(t *testing.T) {
+	t.Parallel()
+
+	got := gdiSheetFor([]chd.TrackInfo{
+		{Number: 1, CUEType: disc.TrackTypeMode1, TotalFrames: 300, RealFrames: 300, GDROM: true},
+		{Number: 2, CUEType: disc.TrackTypeAudio, TotalFrames: disc.HDAStartLBA - 300, RealFrames: 800, GDROM: true},
+		{Number: 3, CUEType: disc.TrackTypeMode1, TotalFrames: 600, RealFrames: 600, GDROM: true},
+	})
+
+	assert.Equal(t, []string{
+		"3",
+		"1 0 4 2352 track01.bin 0 ",
+		"2 300 0 2352 track02.raw 0 ",
+		"3 45000 4 2352 track03.bin 0 ",
+	}, got)
 }
 
 func TestCueSheetForPlainCD(t *testing.T) {
