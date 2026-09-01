@@ -110,7 +110,7 @@ func TestAudioIsStoredByteSwapped(t *testing.T) {
 
 	defer c.close()
 
-	raw, err := readHunk(c.f, c.header, c.records, 0)
+	raw, err := readHunk(c.f, c.header, c.records, 0, &hunkCache{})
 	require.NoError(t, err)
 
 	swapped := bytes.Clone(audio)
@@ -138,7 +138,7 @@ func TestDataTracksAreNotSwapped(t *testing.T) {
 
 	defer c.close()
 
-	raw, err := readHunk(c.f, c.header, c.records, 0)
+	raw, err := readHunk(c.f, c.header, c.records, 0, &hunkCache{})
 	require.NoError(t, err)
 	assert.Equal(t, data[:sectorBytes], raw[:sectorBytes])
 }
@@ -164,15 +164,29 @@ func TestReadHunkFollowsSelfReferences(t *testing.T) {
 
 	defer c.close()
 
-	want, err := readHunk(c.f, c.header, c.records, 0)
+	cache := &hunkCache{}
+
+	want, err := readHunk(c.f, c.header, c.records, 0, cache)
 	require.NoError(t, err)
 
 	// A second record that owns no bytes and points at hunk 0.
 	records := []mapReadRecord{c.records[0], {selfHunk: 0}}
 
-	got, err := readHunk(c.f, c.header, records, 1)
+	got, err := readHunk(c.f, c.header, records, 1, cache)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
+
+	// That read filled the cache, so this one is the hit that could hand back its buffer.
+	hit, err := readHunk(c.f, c.header, records, 1, cache)
+	require.NoError(t, err)
+
+	for i := range hit {
+		hit[i] ^= 0xFF
+	}
+
+	again, err := readHunk(c.f, c.header, records, 1, cache)
+	require.NoError(t, err)
+	assert.Equal(t, want, again, "a caller's edits must not reach the next read")
 }
 
 func TestReadHunkRejectsASelfReferenceCycle(t *testing.T) {
@@ -180,7 +194,7 @@ func TestReadHunkRejectsASelfReferenceCycle(t *testing.T) {
 
 	records := []mapReadRecord{{selfHunk: 1}, {selfHunk: 0}}
 
-	_, err := readHunk(nil, fileHeader{hunkBytes: hunkBytes}, records, 0)
+	_, err := readHunk(nil, fileHeader{hunkBytes: hunkBytes}, records, 0, &hunkCache{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cycle")
 }

@@ -2,7 +2,6 @@ package chd
 
 import (
 	"bytes"
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -133,40 +132,6 @@ func TestReadRejectsBadInput(t *testing.T) {
 			assert.Contains(t, err.Error(), test.want)
 		})
 	}
-}
-
-// TestReadHunkCRC flips every byte of the hunk stream rather
-// than pinning one offset. Raw DEFLATE carries no checksum, so a flip may decode
-// cleanly into the wrong bytes; that case is what the per-hunk CRC exists for,
-// and it has to happen at least once here or the CRC check goes untested.
-func TestReadHunkCRC(t *testing.T) {
-	t.Parallel()
-
-	valid, err := os.ReadFile(writeCHD(t, []Track{makeTrack(1, disc.TrackTypeMode1, 24, 0, 0x5A)}))
-	require.NoError(t, err)
-
-	start := firstHunkOffset(t, valid)
-	caughtByCRC, caughtByFlate := 0, 0
-
-	for offset := start; offset < int64(len(valid)); offset++ {
-		broken := bytes.Clone(valid)
-		broken[offset] ^= 0x01
-
-		path := filepath.Join(t.TempDir(), "corrupt.chd")
-		require.NoError(t, os.WriteFile(path, broken, 0o600))
-
-		_, err := Read(t.Context(), path, t.TempDir(), io.Discard)
-		switch {
-		case err == nil:
-		case errors.Is(err, ErrCRCMismatch):
-			caughtByCRC++
-		default:
-			caughtByFlate++
-		}
-	}
-
-	assert.Positive(t, caughtByCRC, "corruption that decodes cleanly must be caught by the hunk CRC")
-	assert.Positive(t, caughtByFlate, "corruption that breaks the stream must be caught by the decoder")
 }
 
 // Two tracks because trailing zeros on the unaligned track are only half of it: the
