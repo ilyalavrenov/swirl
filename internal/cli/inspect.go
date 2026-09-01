@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/ilyalavrenov/swirl/internal/chd"
 	"github.com/ilyalavrenov/swirl/internal/convert"
 	"github.com/ilyalavrenov/swirl/internal/disc"
+	"github.com/ilyalavrenov/swirl/internal/redump"
 )
 
 type trackJSON struct {
@@ -49,13 +51,21 @@ type infoJSON struct {
 	Tracks      []trackJSON `json:"tracks"`
 }
 
+type redumpJSON struct {
+	DATVersion  string   `json:"dat_version,omitempty"`
+	Titles      []string `json:"titles"`
+	TracksKnown int      `json:"tracks_known"`
+}
+
+// CHD-only fields drop out of a CUE report.
 type verifyJSON struct {
-	File         string `json:"file"`
-	Hunks        int    `json:"hunks"`
-	Tracks       int    `json:"tracks"`
-	LogicalBytes int64  `json:"logical_bytes"`
-	RawSHA1      string `json:"raw_sha1"`
-	CombinedSHA1 string `json:"combined_sha1"`
+	File         string      `json:"file"`
+	Hunks        int         `json:"hunks,omitempty"`
+	Tracks       int         `json:"tracks"`
+	LogicalBytes int64       `json:"logical_bytes,omitempty"`
+	RawSHA1      string      `json:"raw_sha1,omitempty"`
+	CombinedSHA1 string      `json:"combined_sha1,omitempty"`
+	Redump       *redumpJSON `json:"redump,omitempty"`
 }
 
 func infoCommand() *cli.Command {
@@ -208,12 +218,14 @@ func writeTrackTable(w io.Writer, desc convert.Description) error {
 func verifyCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "verify",
-		Usage: "check a CHD's hunk CRCs and SHA1 digests",
-		Description: `Every hunk is decompressed and checked against the CRC stored in the map, then
-both header SHA1 digests are recomputed from what was read.
-
-Agreement means the file is undamaged and internally consistent. It does not
-prove the digests match what chdman would write for the same disc.`,
+		Usage: "check a CHD's integrity, and optionally against redump",
+		Description: `Hunk CRCs and header SHA1s prove a CHD is undamaged, not that it is a
+known-good rip. --dat matches every track against a redump datfile, which does.
+--redump fetches one over plain HTTP, unauthenticated.`,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: flagDAT, Usage: "match every track against this datfile"},
+			&cli.BoolFlag{Name: flagRedump, Usage: "fetch and cache redump's current datfile"},
+		},
 		Arguments: []cli.Argument{
 			&cli.StringArg{Name: argPath},
 		},
@@ -227,15 +239,74 @@ func runVerify(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 
-	chdPath, format, err := detectInput(pathArg)
+	imagePath, format, err := detectInput(pathArg)
 	if err != nil {
 		return err
 	}
 
-	if format != convert.FormatCHD {
-		return fmt.Errorf("%s is a %s image, want chd", filepath.Base(chdPath), format)
+	datPath, useRedump := cmd.String(flagDAT), cmd.Bool(flagRedump)
+	if datPath != "" && useRedump {
+		return errors.New("pass --dat or --redump, not both")
 	}
 
+	wantDAT := datPath != "" || useRedump
+	if err := verifiable(format, filepath.Base(imagePath), wantDAT); err != nil {
+		return err
+	}
+
+	var dat *redump.DAT
+
+	if wantDAT {
+		if dat, err = loadDAT(ctx, cmd, datPath, useRedump); err != nil {
+			return err
+		}
+	}
+
+	if format == convert.FormatCUE {
+		return verifyCUE(cmd, imagePath, dat)
+	}
+
+	return verifyCHD(ctx, cmd, imagePath, dat)
+}
+
+// A GDI can never match: its track files drop the pregaps redump hashes.
+func verifiable(format convert.Format, name string, withDAT bool) error {
+	switch {
+	case format == convert.FormatCHD:
+		return nil
+	case format == convert.FormatCUE && withDAT:
+		return nil
+	case format == convert.FormatGDI && withDAT:
+		return fmt.Errorf("%s is a gdi image: redump records CUE/BIN track files, which keep the pregaps a GDI drops", name)
+	default:
+		return fmt.Errorf("%s is a %s image, want chd", name, format)
+	}
+}
+
+func loadDAT(ctx context.Context, cmd *cli.Command, datPath string, useRedump bool) (*redump.DAT, error) {
+	if useRedump {
+		notice := cmd.Writer
+		if cmd.Bool(flagJSON) {
+			notice = nil
+		}
+
+		cached, err := redump.Fetch(ctx, "swirl/"+cmd.Root().Version, notice)
+		if err != nil {
+			return nil, err
+		}
+
+		return redump.Load(cached)
+	}
+
+	abs, err := absPath(datPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return redump.Load(abs)
+}
+
+func verifyCHD(ctx context.Context, cmd *cli.Command, chdPath string, dat *redump.DAT) error {
 	size, err := chd.LogicalBytes(chdPath)
 	if err != nil {
 		return err
@@ -257,6 +328,8 @@ func runVerify(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 
+	match := dat.Match(report.TrackSHA1)
+
 	if asJSON {
 		return writeJSON(cmd, verifyJSON{
 			File:         filepath.Base(chdPath),
@@ -265,6 +338,7 @@ func runVerify(ctx context.Context, cmd *cli.Command) error {
 			LogicalBytes: report.LogicalBytes,
 			RawSHA1:      hex.EncodeToString(report.RawSHA1),
 			CombinedSHA1: hex.EncodeToString(report.CombinedSHA1),
+			Redump:       redumpOutput(dat, match),
 		})
 	}
 
@@ -273,5 +347,69 @@ func runVerify(ctx context.Context, cmd *cli.Command) error {
 	fmt.Fprintf(cmd.Writer, "  raw SHA1       %x\n", report.RawSHA1)
 	fmt.Fprintf(cmd.Writer, "  combined SHA1  %x\n", report.CombinedSHA1)
 
+	writeRedump(cmd.Writer, dat, match)
+
 	return nil
+}
+
+func verifyCUE(cmd *cli.Command, cuePath string, dat *redump.DAT) error {
+	desc, err := convert.Describe(convert.FormatCUE, cuePath)
+	if err != nil {
+		return err
+	}
+
+	asJSON := cmd.Bool(flagJSON)
+	if !asJSON {
+		fmt.Fprintf(cmd.Writer, "Verifying %s\n", filepath.Base(cuePath))
+	}
+
+	bars := newBars(cmd)
+	bar := bars.step(convert.Step{Name: "Hashing tracks", Bytes: desc.Bytes()})
+
+	sums, err := convert.TrackSHA1(cuePath, desc, bar)
+
+	bars.finish()
+
+	if err != nil {
+		return err
+	}
+
+	match := dat.Match(sums)
+
+	if asJSON {
+		return writeJSON(cmd, verifyJSON{
+			File:   filepath.Base(cuePath),
+			Tracks: len(sums),
+			Redump: redumpOutput(dat, match),
+		})
+	}
+
+	fmt.Fprintf(cmd.Writer, "  %d %s, %s\n", len(sums), plural(len(sums), "track"), formatBytes(desc.Bytes()))
+
+	writeRedump(cmd.Writer, dat, match)
+
+	return nil
+}
+
+func redumpOutput(dat *redump.DAT, res redump.Result) *redumpJSON {
+	if dat == nil {
+		return nil
+	}
+
+	return &redumpJSON{DATVersion: dat.Version, Titles: res.Titles, TracksKnown: res.KnownCount()}
+}
+
+func writeRedump(w io.Writer, dat *redump.DAT, res redump.Result) {
+	if dat == nil {
+		return
+	}
+
+	if len(res.Titles) > 0 {
+		fmt.Fprintf(w, "  redump         %s\n", strings.Join(res.Titles, ", "))
+
+		return
+	}
+
+	// No match is a normal answer; the known count separates unlisted from wrong.
+	fmt.Fprintf(w, "  redump         no match (%d of %d tracks known)\n", res.KnownCount(), len(res.Known))
 }

@@ -701,3 +701,45 @@ func TestDescribeWithoutTrackOne(t *testing.T) {
 	require.Len(t, got.Tracks, 1)
 	assert.Equal(t, 2, got.Tracks[0].Number)
 }
+
+// A CHD and the CUE it was built from have to hash identically, or a datfile match on one
+// is a mismatch on the other. Pregaps are where the two paths diverge.
+func TestCHDAndCUEHashTheSameTracks(t *testing.T) {
+	t.Parallel()
+
+	img := newImage(t).
+		track("track01.bin", 8, 0x11).
+		track("track02.raw", 5+150, 0x22)
+
+	// Varying samples, so a byte order that disagrees between the two paths shows up.
+	audio := make([]byte, (5+150)*disc.SectorBytes)
+	for i := range audio {
+		audio[i] = byte(i * 7)
+	}
+
+	img.write("track02.raw", audio)
+
+	cuePath := img.sheet("disc.cue", `FILE "track01.bin" BINARY
+  TRACK 01 MODE1/2352
+    INDEX 01 00:00:00
+FILE "track02.raw" BINARY
+  TRACK 02 AUDIO
+    INDEX 00 00:00:00
+    INDEX 01 00:02:00
+`)
+
+	chdPath := filepath.Join(t.TempDir(), "disc.chd")
+	_, err := convert.Run(t.Context(), convert.FormatCUE, convert.FormatCHD, cuePath, chdPath, convert.Options{})
+	require.NoError(t, err)
+
+	desc, err := convert.Describe(convert.FormatCUE, cuePath)
+	require.NoError(t, err)
+
+	fromCUE, err := convert.TrackSHA1(cuePath, desc, io.Discard)
+	require.NoError(t, err)
+
+	report, err := chd.Verify(t.Context(), chdPath, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, fromCUE, report.TrackSHA1)
+}

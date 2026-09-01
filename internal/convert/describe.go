@@ -2,6 +2,7 @@ package convert
 
 import (
 	"bytes"
+	"crypto/sha1" //nolint:gosec // SHA1 is what redump records
 	"fmt"
 	"io"
 	"os"
@@ -142,6 +143,39 @@ func describeCHD(path string) (Description, error) {
 	desc.Stored = stored
 
 	return desc, nil
+}
+
+// TrackSHA1 digests each track file whole, leading pregap included, as redump records it.
+func TrackSHA1(imagePath string, desc Description, progress io.Writer) ([][]byte, error) {
+	workingDir := filepath.Dir(imagePath)
+	sums := make([][]byte, 0, len(desc.Tracks))
+
+	for _, t := range desc.Tracks {
+		sum, err := fileSHA1(filepath.Join(workingDir, t.File), progress)
+		if err != nil {
+			return nil, fmt.Errorf("track %d: %w", t.Number, err)
+		}
+
+		sums = append(sums, sum)
+	}
+
+	return sums, nil
+}
+
+func fileSHA1(path string, progress io.Writer) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("track: %w", err)
+	}
+	defer f.Close()
+
+	sum := sha1.New() //nolint:gosec // SHA1 is what redump records
+
+	if _, err := io.Copy(io.MultiWriter(sum, progress), f); err != nil {
+		return nil, fmt.Errorf("hash %s: %w", filepath.Base(path), err)
+	}
+
+	return sum.Sum(nil), nil
 }
 
 // Any failure yields an empty header: a headerless track 1 is not worth failing a listing over.

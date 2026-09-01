@@ -205,7 +205,12 @@ func Read(ctx context.Context, inputPath, outputDir string, progress io.Writer) 
 		outFiles[i] = out
 	}
 
-	writer := newTrackWriter(c.tracks, outFiles)
+	sinks := make([]io.Writer, len(outFiles))
+	for i, of := range outFiles {
+		sinks[i] = of
+	}
+
+	writer := newTrackWriter(c.tracks, sinks)
 	if err := extractHunks(ctx, c, writer, progress); err != nil {
 		return nil, fmt.Errorf("%s: %w", inputPath, err)
 	}
@@ -221,11 +226,11 @@ func Read(ctx context.Context, inputPath, outputDir string, progress io.Writer) 
 	return c.tracks, nil
 }
 
-// Routes sectors by LBA. A range starts before its track when a pregap heads the file;
-// frames between ranges are padding no file wants.
+// Routes sectors by LBA to the right track sink. A range starts before its track when a
+// pregap heads the file; frames between ranges are padding no file wants.
 type trackWriter struct {
 	tracks []TrackInfo
-	files  []*os.File
+	sinks  []io.Writer
 	spans  []span
 	lba    int
 	idx    int
@@ -233,7 +238,7 @@ type trackWriter struct {
 
 type span struct{ start, end int }
 
-func newTrackWriter(tracks []TrackInfo, files []*os.File) *trackWriter {
+func newTrackWriter(tracks []TrackInfo, sinks []io.Writer) *trackWriter {
 	spans := make([]span, len(tracks))
 
 	startLBA := 0
@@ -249,24 +254,7 @@ func newTrackWriter(tracks []TrackInfo, files []*os.File) *trackWriter {
 		spans[i-1].end = min(spans[i-1].end, spans[i].start)
 	}
 
-	return &trackWriter{tracks: tracks, files: files, spans: spans}
-}
-
-// Sectors past the last track are dropped rather than refused: they are padding the
-// hunk's CRC has already covered.
-func (w *trackWriter) writeHunk(raw []byte) error {
-	for off := 0; off+slotBytes <= len(raw); off += slotBytes {
-		more, err := w.writeSector(raw[off : off+sectorBytes])
-		if err != nil {
-			return err
-		}
-
-		if !more {
-			return nil
-		}
-	}
-
-	return nil
+	return &trackWriter{tracks: tracks, sinks: sinks, spans: spans}
 }
 
 // Reports false once every track is full.
@@ -290,11 +278,22 @@ func (w *trackWriter) writeSector(sector []byte) (bool, error) {
 		swapAudio(sector)
 	}
 
-	if _, err := w.files[w.idx].Write(sector); err != nil {
+	if _, err := w.sinks[w.idx].Write(sector); err != nil {
 		return false, fmt.Errorf("write track %d: %w", w.tracks[w.idx].Number, err)
 	}
 
 	return true, nil
+}
+
+func (w *trackWriter) writeHunk(raw []byte) error {
+	for off := 0; off+slotBytes <= len(raw); off += slotBytes {
+		more, err := w.writeSector(raw[off : off+sectorBytes])
+		if err != nil || !more {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Hunks past the last track are still CRC-checked, so trailing data cannot hide corruption.
