@@ -29,7 +29,7 @@ swirl --json info ./out/disc.chd                     # same, machine-readable
 `<input>` is a `.cue`, `.gdi`, or `.chd`, or a directory holding exactly one;
 `<output>` is a file for chd and a directory for cue and gdi. The format follows
 the output extension unless `--to` overrides it. Supported: cue to gdi or chd,
-gdi to cue or chd, chd to cue.
+gdi to cue or chd, chd to cue or gdi.
 
 CHD output defaults to `cdzl,cdfl`: audio hunks take the smaller of deflate and
 FLAC, which is roughly a fifth off a disc with a redbook soundtrack. `--codec
