@@ -648,7 +648,7 @@ func TestDescribeNameFromTrackOne(t *testing.T) {
 
 	got, err := convert.Describe(convert.FormatGDI, gdiPath)
 	require.NoError(t, err)
-	assert.Equal(t, "REAL NAME", got.Name)
+	assert.Equal(t, "REAL NAME", got.IPBin.Title)
 }
 
 // TestDescribeNamePastPregap covers a track 1 that opens with 150
@@ -668,7 +668,7 @@ func TestDescribeNamePastPregap(t *testing.T) {
 
 	got, err := convert.Describe(convert.FormatCUE, cuePath)
 	require.NoError(t, err)
-	assert.Equal(t, "PREGAPPED", got.Name)
+	assert.Equal(t, "PREGAPPED", got.IPBin.Title)
 }
 
 func TestDescribeWithoutName(t *testing.T) {
@@ -682,7 +682,7 @@ func TestDescribeWithoutName(t *testing.T) {
 
 	got, err := convert.Describe(convert.FormatCUE, cuePath)
 	require.NoError(t, err)
-	assert.Empty(t, got.Name, "a blank track 1 has no name, which is not an error")
+	assert.Empty(t, got.IPBin.Title, "a blank track 1 has no name, which is not an error")
 }
 
 // TestDescribeWithoutTrackOne covers a sheet that numbers its tracks from 2.
@@ -697,7 +697,7 @@ func TestDescribeWithoutTrackOne(t *testing.T) {
 	got, err := convert.Describe(convert.FormatGDI, gdiPath)
 	require.NoError(t, err)
 
-	assert.Empty(t, got.Name, "no track 1 means no name, not a crash")
+	assert.Empty(t, got.IPBin.Title, "no track 1 means no name, not a crash")
 	require.Len(t, got.Tracks, 1)
 	assert.Equal(t, 2, got.Tracks[0].Number)
 }

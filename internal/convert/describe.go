@@ -31,7 +31,7 @@ func (t TrackDesc) Bytes() int64 {
 
 type Description struct {
 	Format Format
-	Name   string // IP.BIN product name, empty when there is none to read
+	IPBin  ipbin.Header // zero when track 1 carries no header
 	GDROM  bool
 	Codec  string // CHD only
 	Hunks  int    // CHD only
@@ -76,7 +76,7 @@ func describeCUE(path string) (Description, error) {
 
 	return Description{
 		Format: FormatCUE,
-		Name:   productName(workingDir, l.tracks),
+		IPBin:  trackHeader(workingDir, l.tracks),
 		GDROM:  l.gdrom,
 		Tracks: l.tracks,
 	}, nil
@@ -97,7 +97,7 @@ func describeGDI(path string) (Description, error) {
 
 	return Description{
 		Format: FormatGDI,
-		Name:   productName(workingDir, l.tracks),
+		IPBin:  trackHeader(workingDir, l.tracks),
 		GDROM:  l.gdrom,
 		Tracks: l.tracks,
 	}, nil
@@ -126,7 +126,7 @@ func describeCHD(path string) (Description, error) {
 
 	desc := Description{
 		Format: FormatCHD,
-		Name:   chdName(path),
+		IPBin:  chdHeader(path),
 		GDROM:  len(info.Tracks) > 0 && info.Tracks[0].GDROM,
 		Codec:  info.Codec,
 		Hunks:  info.Hunks,
@@ -143,42 +143,42 @@ func describeCHD(path string) (Description, error) {
 	return desc, nil
 }
 
-// Any failure yields an empty name: a headerless track 1 is not worth failing a listing over.
-func productName(workingDir string, tracks []TrackDesc) string {
+// Any failure yields an empty header: a headerless track 1 is not worth failing a listing over.
+func trackHeader(workingDir string, tracks []TrackDesc) ipbin.Header {
 	i := slices.IndexFunc(tracks, func(t TrackDesc) bool { return t.Number == 1 })
 	if i < 0 {
-		return ""
+		return ipbin.Header{}
 	}
 
 	f, err := os.Open(filepath.Join(workingDir, tracks[i].File))
 	if err != nil {
-		return ""
+		return ipbin.Header{}
 	}
 	defer f.Close()
 
 	// IP.BIN starts after the pregap, not at the head of the file.
 	head := io.NewSectionReader(f, int64(tracks[i].Pregap)*disc.SectorBytes, disc.SectorBytes)
 
-	name, err := ipbin.ProductNameAt(head)
+	h, err := ipbin.Read(head)
 	if err != nil {
-		return ""
+		return ipbin.Header{}
 	}
 
-	return name
+	return h
 }
 
-func chdName(path string) string {
+func chdHeader(path string) ipbin.Header {
 	sector, err := chd.FirstSector(path)
 	if err != nil {
-		return ""
+		return ipbin.Header{}
 	}
 
-	name, err := ipbin.ProductNameAt(bytes.NewReader(sector))
+	h, err := ipbin.Read(bytes.NewReader(sector))
 	if err != nil {
-		return ""
+		return ipbin.Header{}
 	}
 
-	return name
+	return h
 }
 
 type discLayout struct {
