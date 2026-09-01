@@ -202,8 +202,8 @@ func TestCueSheetForPlainCD(t *testing.T) {
 	assert.NotContains(t, got, hdaRem, "an ordinary CD has no high-density area")
 	assert.Equal(t, []string{
 		`FILE "track01.bin" BINARY`, "  TRACK 01 MODE1/2352", "    INDEX 01 00:00:00",
-		`FILE "track02.raw" AUDIO`, "  TRACK 02 AUDIO", "    INDEX 01 00:00:00",
-		`FILE "track03.raw" AUDIO`, "  TRACK 03 AUDIO", "    INDEX 01 00:00:00",
+		`FILE "track02.raw" BINARY`, "  TRACK 02 AUDIO", "    INDEX 01 00:00:00",
+		`FILE "track03.raw" BINARY`, "  TRACK 03 AUDIO", "    INDEX 01 00:00:00",
 	}, got)
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -225,7 +226,7 @@ func TestGDIToCUE(t *testing.T) {
 		`FILE "track01.bin" BINARY`,
 		"  TRACK 01 MODE1/2352",
 		"    INDEX 01 00:00:00",
-		`FILE "track02.raw" AUDIO`,
+		`FILE "track02.raw" BINARY`,
 		"  TRACK 02 AUDIO",
 		"    INDEX 01 00:00:00",
 		"REM HIGH-DENSITY AREA",
@@ -270,6 +271,21 @@ FILE "track02.raw" AUDIO
 		require.NoError(t, err)
 		assert.Equal(t, want, got, "%s survived the round trip", name)
 	}
+
+	// swirl's parser ignores the FILE type, so only chdman catches an invalid one.
+	t.Run("chdman accepts the cue", func(t *testing.T) {
+		t.Parallel()
+
+		chdman, err := exec.LookPath("chdman")
+		if err != nil {
+			t.Skip("chdman not installed: the cue swirl writes is not being validated")
+		}
+
+		out, err := exec.CommandContext(t.Context(), chdman, "createcd",
+			"-i", filepath.Join(outputDir, "disc.cue"),
+			"-o", filepath.Join(t.TempDir(), "rebuilt.chd"), "-f").CombinedOutput()
+		require.NoError(t, err, "chdman createcd: %s", out)
+	})
 }
 
 func TestGDIToCHD(t *testing.T) {
