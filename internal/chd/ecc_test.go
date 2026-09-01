@@ -110,7 +110,7 @@ func TestAudioIsStoredByteSwapped(t *testing.T) {
 
 	defer c.close()
 
-	raw, err := readHunk(c.f, c.records, 0, c.header.hunkBytes)
+	raw, err := readHunk(c.f, c.header, c.records, 0)
 	require.NoError(t, err)
 
 	swapped := bytes.Clone(audio)
@@ -138,7 +138,7 @@ func TestDataTracksAreNotSwapped(t *testing.T) {
 
 	defer c.close()
 
-	raw, err := readHunk(c.f, c.records, 0, c.header.hunkBytes)
+	raw, err := readHunk(c.f, c.header, c.records, 0)
 	require.NoError(t, err)
 	assert.Equal(t, data[:sectorBytes], raw[:sectorBytes])
 }
@@ -164,13 +164,13 @@ func TestReadHunkFollowsSelfReferences(t *testing.T) {
 
 	defer c.close()
 
-	want, err := readHunk(c.f, c.records, 0, c.header.hunkBytes)
+	want, err := readHunk(c.f, c.header, c.records, 0)
 	require.NoError(t, err)
 
 	// A second record that owns no bytes and points at hunk 0.
 	records := []mapReadRecord{c.records[0], {selfHunk: 0}}
 
-	got, err := readHunk(c.f, records, 1, c.header.hunkBytes)
+	got, err := readHunk(c.f, c.header, records, 1)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 }
@@ -180,7 +180,7 @@ func TestReadHunkRejectsASelfReferenceCycle(t *testing.T) {
 
 	records := []mapReadRecord{{selfHunk: 1}, {selfHunk: 0}}
 
-	_, err := readHunk(nil, records, 0, hunkBytes)
+	_, err := readHunk(nil, fileHeader{hunkBytes: hunkBytes}, records, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cycle")
 }

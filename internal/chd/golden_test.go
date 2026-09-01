@@ -34,17 +34,6 @@ const (
 	goldenCombinedSHA1 = "5468829351b7462e8bde84a4885d0260d08110d3"
 )
 
-func TestGoldenDigestsMatchChdman(t *testing.T) {
-	t.Parallel()
-
-	report, err := Verify(t.Context(), goldenPath, nil)
-	require.NoError(t, err)
-
-	assert.Equal(t, goldenRawSHA1, hexString(report.RawSHA1), "raw SHA1")
-	assert.Equal(t, goldenCombinedSHA1, hexString(report.CombinedSHA1), "combined SHA1")
-	assert.Equal(t, 8, report.Hunks, "7.5 hunks of data must round up to 8")
-}
-
 func hexString(b []byte) string {
 	var sb strings.Builder
 	for _, c := range b {
@@ -168,17 +157,6 @@ const (
 	goldenGDROMCombinedSHA1 = "43b586526f1229205fcce751e90cdb31c802d9a2"
 )
 
-func TestGoldenGDROMDigestsMatchChdman(t *testing.T) {
-	t.Parallel()
-
-	report, err := Verify(t.Context(), goldenGDROMPath, nil)
-	require.NoError(t, err)
-
-	assert.Equal(t, goldenGDROMRawSHA1, hexString(report.RawSHA1), "raw SHA1")
-	assert.Equal(t, goldenGDROMCombinedSHA1, hexString(report.CombinedSHA1), "combined SHA1")
-	assert.Equal(t, 5627, report.Hunks)
-}
-
 func TestGoldenGDROMReachesTheWiderPaths(t *testing.T) {
 	t.Parallel()
 
@@ -264,4 +242,74 @@ func TestGoldenGDROMExtractsEveryTrack(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, hda, 12*sectorBytes)
 	assert.Equal(t, syncHeader(), hda[:len(syncHeader())], "parity restored past the high-density boundary")
+}
+
+// golden.chd's disc recompressed with zstd, so it must report golden's own digests.
+const goldenCDZSPath = "testdata/golden-cdzs.chd"
+
+// chdman's default codec set, which is what an image in the wild uses. Its audio is real
+// CD audio: chdman beats FLAC with LZMA on anything synthetic, leaving cdfl untested.
+const goldenMixedPath = "testdata/golden-mixed.chd"
+
+const (
+	goldenMixedRawSHA1      = "9122c6cf040881d12a6f6a0cf5b893f29699829c"
+	goldenMixedCombinedSHA1 = "ea3f92d8fc2a8e9781d2eb524d1aae764290cbb4"
+)
+
+func TestGoldenFixturesMatchChdman(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		path, codecs, raw, combined string
+		hunks                       int
+		mustUse                     []string
+	}{
+		"deflate":   {goldenPath, "cdzl", goldenRawSHA1, goldenCombinedSHA1, 8, nil},
+		"zstandard": {goldenCDZSPath, "cdzs", goldenRawSHA1, goldenCombinedSHA1, 8, nil},
+		"GD-ROM": {
+			goldenGDROMPath, "cdzl", goldenGDROMRawSHA1, goldenGDROMCombinedSHA1, 5627, nil,
+		},
+		"chdman's default set": {
+			goldenMixedPath, "cdlz, cdzl, cdfl", goldenMixedRawSHA1, goldenMixedCombinedSHA1, 8,
+			[]string{"cdlz", "cdfl"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			info, err := Stat(test.path)
+			require.NoError(t, err)
+			assert.Equal(t, test.codecs, info.Codec)
+
+			report, err := Verify(t.Context(), test.path, nil)
+			require.NoError(t, err)
+			assert.Equal(t, test.raw, hexString(report.RawSHA1), "raw SHA1")
+			assert.Equal(t, test.combined, hexString(report.CombinedSHA1), "combined SHA1")
+			assert.Equal(t, test.hunks, report.Hunks)
+
+			for _, tag := range test.mustUse {
+				assert.Contains(t, hunkCodecs(t, test.path), tag, "no hunk uses it, so that decoder is untested")
+			}
+		})
+	}
+}
+
+// The codec tag of every hunk carrying its own data.
+func hunkCodecs(t *testing.T, path string) []string {
+	t.Helper()
+
+	c, err := openCHD(path)
+	require.NoError(t, err)
+
+	defer c.close()
+
+	var tags []string
+
+	for _, r := range c.records {
+		if r.selfHunk < 0 && r.compType != mapCompNone {
+			tags = append(tags, tagString(c.header.codecs[r.compType]))
+		}
+	}
+
+	return tags
 }

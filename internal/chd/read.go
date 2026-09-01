@@ -67,13 +67,15 @@ type fileHeader struct {
 	hunkBytes    int
 	numHunks     int
 	version      uint32
-	codec        uint32
+	codecs       [numCompressors]uint32
+
 	rawSHA1      []byte // as stored; Verify compares its own recomputation
 	combinedSHA1 []byte
 }
 
-// Only CDZLIB is accepted; an unknown codec decodes to plausible garbage. The rest is
+// An unsupported codec is rejected rather than decoded to plausible garbage. The rest is
 // checked against the file size: no divide by zero, no allocation the file cannot fill.
+
 func readHeader(f *os.File, path string) (fileHeader, error) {
 	info, err := f.Stat()
 	if err != nil {
@@ -94,9 +96,19 @@ func readHeader(f *os.File, path string) (fileHeader, error) {
 		return fileHeader{}, fmt.Errorf("%s: CHD version %d is not supported, want %d", path, version, chdVersion)
 	}
 
-	codec := binary.BigEndian.Uint32(hdr[0x10:])
-	if codec != codecCDZlib {
-		return fileHeader{}, fmt.Errorf("%s: compressor %q, want cdzl", path, tagString(codec))
+	var codecs [numCompressors]uint32
+
+	for i := range codecs {
+		codecs[i] = binary.BigEndian.Uint32(hdr[headerCodecOffset+i*4:])
+		// Slot 0 must be set; a later zero slot just means chdman was given fewer codecs.
+		if codecs[i] == 0 && i > 0 {
+			continue
+		}
+
+		if !supportedCodec(codecs[i]) {
+			return fileHeader{}, fmt.Errorf("%s: compressor %d is %q, which swirl cannot decode",
+				path, i, tagString(codecs[i]))
+		}
 	}
 
 	//nolint:gosec // G115: the values are range-checked immediately below
@@ -107,7 +119,8 @@ func readHeader(f *os.File, path string) (fileHeader, error) {
 		metaOffset:   int64(binary.BigEndian.Uint64(hdr[0x30:])),
 		hunkBytes:    int(binary.BigEndian.Uint32(hdr[0x38:])),
 		version:      version,
-		codec:        codec,
+		codecs:       codecs,
+
 		rawSHA1:      bytes.Clone(hdr[headerRawSHA1Offset : headerRawSHA1Offset+sha1.Size]),
 		combinedSHA1: bytes.Clone(hdr[headerCombinedSHA1Offset : headerCombinedSHA1Offset+sha1.Size]),
 	}
@@ -186,7 +199,7 @@ func Read(ctx context.Context, inputPath, outputDir string, progress io.Writer) 
 	}
 
 	writer := newTrackWriter(c.tracks, outFiles)
-	if err := extractHunks(ctx, c.f, c.records, writer, c.header.hunkBytes, progress); err != nil {
+	if err := extractHunks(ctx, c.f, c.header, c.records, writer, progress); err != nil {
 		return nil, fmt.Errorf("%s: %w", inputPath, err)
 	}
 
@@ -256,19 +269,20 @@ func (w *trackWriter) writeSector(sector []byte) (bool, error) {
 func extractHunks(
 	ctx context.Context,
 	f *os.File,
+	h fileHeader,
 	records []mapReadRecord,
 	w *trackWriter,
-	storedHunkBytes int,
 	progress io.Writer,
 ) error {
-	framesInHunk := storedHunkBytes / slotBytes
+	framesInHunk := h.hunkBytes / slotBytes
 
 	for hunkIdx := range records {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
 
-		raw, err := readHunk(f, records, hunkIdx, storedHunkBytes)
+		raw, err := readHunk(f, h, records, hunkIdx)
+
 		if err != nil {
 			return fmt.Errorf("hunk %d: %w", hunkIdx, err)
 		}
@@ -535,26 +549,13 @@ func readMapEntries(
 		rec.selfHunk = -1
 
 		switch rec.compType {
-		case mapCompType0, mapCompNone:
-			length := uint32(h.hunkBytes) //nolint:gosec // G115: hunkBytes fits in uint32
-
-			if rec.compType == mapCompType0 {
-				l, ok := br.readBits(lengthBits)
-				if !ok {
-					return fmt.Errorf("truncated map: length for hunk %d", idx)
-				}
-
-				length = l
+		case mapCompType0, mapCompType1, mapCompType2, mapCompType3, mapCompNone:
+			next, err := readStoredEntry(br, rec, h, idx, lengthBits, offset)
+			if err != nil {
+				return err
 			}
 
-			crc, ok := br.readBits(mapCRCBits)
-			if !ok {
-				return fmt.Errorf("truncated map: CRC for hunk %d", idx)
-			}
-
-			rec.length, rec.offset = length, offset
-			rec.crc = uint16(crc) //nolint:gosec // G115: the field is exactly mapCRCBits wide
-			offset += int64(length)
+			offset = next
 
 		case mapCompSelf:
 			v, ok := br.readBits(selfBits)
@@ -700,11 +701,11 @@ func decodeHuffmanSym(br *bitReader, codes []huffmanCodeEntry) (int, error) {
 
 // Resolves a self-reference to the hunk holding the data, then checks the map's CRC,
 // so a hunk that decompresses cleanly into the wrong bytes cannot reach a caller.
-func readHunk(f *os.File, records []mapReadRecord, idx, storedHunkBytes int) ([]byte, error) {
+func readHunk(f *os.File, h fileHeader, records []mapReadRecord, idx int) ([]byte, error) {
 	for range maxSelfChain {
 		rec := records[idx]
 		if rec.selfHunk < 0 {
-			return readStoredHunk(f, rec, storedHunkBytes)
+			return readStoredHunk(f, h, rec)
 		}
 
 		idx = rec.selfHunk
@@ -713,8 +714,8 @@ func readHunk(f *os.File, records []mapReadRecord, idx, storedHunkBytes int) ([]
 	return nil, errors.New("self-references form a cycle")
 }
 
-func readStoredHunk(f *os.File, rec mapReadRecord, storedHunkBytes int) ([]byte, error) {
-	raw := make([]byte, storedHunkBytes)
+func readStoredHunk(f *os.File, h fileHeader, rec mapReadRecord) ([]byte, error) {
+	raw := make([]byte, h.hunkBytes)
 
 	if rec.compType == mapCompNone {
 		if _, err := f.ReadAt(raw, rec.offset); err != nil {
@@ -727,7 +728,7 @@ func readStoredHunk(f *os.File, rec mapReadRecord, storedHunkBytes int) ([]byte,
 		}
 
 		var err error
-		if raw, err = decompressCDZLIB(compressed, storedHunkBytes); err != nil {
+		if raw, err = decompressHunk(h.codecs[rec.compType], compressed, h.hunkBytes); err != nil {
 			return nil, err
 		}
 	}
@@ -737,51 +738,6 @@ func readStoredHunk(f *os.File, rec mapReadRecord, storedHunkBytes int) ([]byte,
 	}
 
 	return raw, nil
-}
-
-func decompressCDZLIB(data []byte, storedHunkBytes int) ([]byte, error) {
-	frames := storedHunkBytes / slotBytes
-	eccBytes := (frames + bitsPerByte - 1) / bitsPerByte // 1 for framesPerHunk=8
-
-	const sectorCmpLenBytes = 2
-
-	if len(data) < eccBytes+sectorCmpLenBytes {
-		return nil, fmt.Errorf("CDZLIB hunk too short (%d bytes)", len(data))
-	}
-
-	baseCmpLen := int(binary.BigEndian.Uint16(data[eccBytes:]))
-	sectorCmpStart := eccBytes + sectorCmpLenBytes
-
-	if sectorCmpStart+baseCmpLen > len(data) {
-		return nil, errors.New("CDZLIB sector block overflows hunk")
-	}
-
-	sectorData, err := zlibDecompress(data[sectorCmpStart:sectorCmpStart+baseCmpLen], frames*sectorBytes)
-	if err != nil {
-		return nil, fmt.Errorf("decompress sector data: %w", err)
-	}
-
-	// Unused here, but covered by the stored hunk CRC, so it still has to be decoded.
-	subcodeData, err := zlibDecompress(data[sectorCmpStart+baseCmpLen:], frames*subcodeBytes)
-	if err != nil {
-		return nil, fmt.Errorf("decompress subcode data: %w", err)
-	}
-
-	out := make([]byte, storedHunkBytes)
-	stripped := data[:eccBytes]
-	tables := newECCTables()
-
-	for i := range frames {
-		copy(out[i*slotBytes:], sectorData[i*sectorBytes:(i+1)*sectorBytes])
-		copy(out[i*slotBytes+sectorBytes:], subcodeData[i*subcodeBytes:(i+1)*subcodeBytes])
-
-		// A set bit means the encoder dropped this sector's sync header and parity: chdman always does, Write never.
-		if stripped[i/bitsPerByte]&(1<<(i%bitsPerByte)) != 0 {
-			tables.restoreSector(out[i*slotBytes : i*slotBytes+sectorBytes])
-		}
-	}
-
-	return out, nil
 }
 
 // Same reasoning as flateWriters: two decoder allocations per hunk otherwise.
@@ -843,4 +799,34 @@ func (br *bitReader) readBits(n int) (uint32, bool) {
 	}
 
 	return v, true
+}
+
+// Length, unless the hunk was stored whole, then CRC. Returns where the next hunk starts.
+func readStoredEntry(
+	br *bitReader, rec *mapReadRecord, h fileHeader, idx, lengthBits int, offset int64,
+) (int64, error) {
+	length := uint32(h.hunkBytes) //nolint:gosec // G115: hunkBytes fits in uint32
+
+	if rec.compType != mapCompNone {
+		if h.codecs[rec.compType] == 0 {
+			return 0, fmt.Errorf("hunk %d names compressor %d, which the header leaves empty", idx, rec.compType)
+		}
+
+		l, ok := br.readBits(lengthBits)
+		if !ok {
+			return 0, fmt.Errorf("truncated map: length for hunk %d", idx)
+		}
+
+		length = l
+	}
+
+	crc, ok := br.readBits(mapCRCBits)
+	if !ok {
+		return 0, fmt.Errorf("truncated map: CRC for hunk %d", idx)
+	}
+
+	rec.length, rec.offset = length, offset
+	rec.crc = uint16(crc) //nolint:gosec // G115: the field is exactly mapCRCBits wide
+
+	return offset + int64(length), nil
 }

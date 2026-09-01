@@ -33,10 +33,6 @@ gdi to cue or chd, chd to cue.
 Output is staged and renamed into place, so a failed run leaves nothing
 half-written. GDI output gets a `name.txt` holding the IP.BIN game name.
 
-swirl implements one CHD codec, `cdzl`, and rejects a CHD compressed any other
-way. chdman defaults to `cdlz,cdzl,cdfl`, so pass `-c cdzl` to make one swirl can
-read. CHDs with a parent are not supported.
-
 ## License
 
 MIT, see [LICENSE](LICENSE).

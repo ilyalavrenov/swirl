@@ -30,10 +30,18 @@ const (
 	hunkBytes     = framesPerHunk * slotBytes // 19584
 	trackPadding  = 4
 
+	// Read accepts all four; Write emits only cdzl.
 	codecCDZlib = uint32('c')<<24 | uint32('d')<<16 | uint32('z')<<8 | uint32('l')
+	codecCDLzma = uint32('c')<<24 | uint32('d')<<16 | uint32('l')<<8 | uint32('z')
+	codecCDFlac = uint32('c')<<24 | uint32('d')<<16 | uint32('f')<<8 | uint32('l')
+	codecCDZstd = uint32('c')<<24 | uint32('d')<<16 | uint32('z')<<8 | uint32('s')
 
+	// Types 0-3 index the header's compressor slots, so one file mixes codecs.
 	// https://github.com/mamedev/mame/blob/33c42e9e0e89c879e0fc5b654cc70b947bf1473c/src/lib/util/chd.cpp#L68-L76
-	mapCompType0 = 0 // compressed with compressor 0 (CDZLIB)
+	mapCompType0 = 0
+	mapCompType1 = 1
+	mapCompType2 = 2
+	mapCompType3 = 3
 	mapCompNone  = 4
 
 	// Read-side only; chdman emits these. SELF names an earlier identical hunk, RLE
@@ -63,8 +71,11 @@ const (
 
 	tagBytes = 4
 
+	headerCodecOffset        = 0x10
 	headerRawSHA1Offset      = 0x40
 	headerCombinedSHA1Offset = 0x54
+
+	numCompressors = 4
 
 	// The entry size the map CRC is computed over.
 	mapEntryBytes     = 12
@@ -750,7 +761,8 @@ func makeHeader(totalLogical, mapOffset, metaOffset int64) []byte {
 	copy(h[0x00:], headerMagic)
 	binary.BigEndian.PutUint32(h[0x08:], headerSize)
 	binary.BigEndian.PutUint32(h[0x0C:], chdVersion)
-	binary.BigEndian.PutUint32(h[0x10:], codecCDZlib) // compressors[0]
+	binary.BigEndian.PutUint32(h[headerCodecOffset:], codecCDZlib) // compressors[0]
+
 	// compressors[1..3] = 0 (only one codec needed)
 	//nolint:gosec // G115: sizes and file offsets are always non-negative
 	binary.BigEndian.PutUint64(h[0x20:], uint64(totalLogical))

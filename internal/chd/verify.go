@@ -83,8 +83,9 @@ func Stat(path string) (Info, error) {
 	defer c.close()
 
 	return Info{
-		Version:      c.header.version,
-		Codec:        tagString(c.header.codec),
+		Version: c.header.version,
+		Codec:   codecList(c.header.codecs),
+
 		LogicalBytes: c.header.logicalBytes,
 		HunkBytes:    c.header.hunkBytes,
 		Hunks:        len(c.records),
@@ -123,7 +124,7 @@ func Verify(ctx context.Context, path string, progress io.Writer) (VerifyReport,
 			return VerifyReport{}, fmt.Errorf("verify %s: %w", path, ctxErr)
 		}
 
-		raw, hunkErr := readHunk(c.f, c.records, hunkIdx, c.header.hunkBytes)
+		raw, hunkErr := readHunk(c.f, c.header, c.records, hunkIdx)
 		if hunkErr != nil {
 			return VerifyReport{}, fmt.Errorf("%s: hunk %d: %w", path, hunkIdx, hunkErr)
 		}
@@ -180,7 +181,7 @@ func FirstSector(path string) ([]byte, error) {
 	}
 	defer c.close()
 
-	raw, err := readHunk(c.f, c.records, 0, c.header.hunkBytes)
+	raw, err := readHunk(c.f, c.header, c.records, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%s: hunk 0: %w", path, err)
 	}
