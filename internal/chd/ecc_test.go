@@ -110,8 +110,7 @@ func TestAudioIsStoredByteSwapped(t *testing.T) {
 
 	defer c.close()
 
-	raw, err := readHunk(c.f, c.header, c.records, 0, &hunkCache{})
-	require.NoError(t, err)
+	raw := firstHunk(t, c)
 
 	swapped := bytes.Clone(audio)
 	swapAudio(swapped)
@@ -138,14 +137,12 @@ func TestDataTracksAreNotSwapped(t *testing.T) {
 
 	defer c.close()
 
-	raw, err := readHunk(c.f, c.header, c.records, 0, &hunkCache{})
-	require.NoError(t, err)
-	assert.Equal(t, data[:sectorBytes], raw[:sectorBytes])
+	assert.Equal(t, data[:sectorBytes], firstHunk(t, c)[:sectorBytes])
 }
 
-// A self-reference carries no data of its own, so the reader has to follow it to
-// the hunk that does. swirl never writes one; chdman writes them constantly.
-func TestReadHunkFollowsSelfReferences(t *testing.T) {
+// A batch decodes a self-reference's target once however many references reach it, so
+// each still has to come back with its own buffer: the caller byte-swaps audio in place.
+func TestDecompressBatchFollowsSelfReferences(t *testing.T) {
 	t.Parallel()
 
 	const frames = 4
@@ -164,37 +161,39 @@ func TestReadHunkFollowsSelfReferences(t *testing.T) {
 
 	defer c.close()
 
-	cache := &hunkCache{}
+	want := firstHunk(t, c)
 
-	want, err := readHunk(c.f, c.header, c.records, 0, cache)
+	records := []mapReadRecord{c.records[0], {selfHunk: 0}, {selfHunk: 0}}
+
+	batch, err := decompressBatch(c.f, c.header, records, 0, len(records))
 	require.NoError(t, err)
+	require.Len(t, batch, len(records))
 
-	// A second record that owns no bytes and points at hunk 0.
-	records := []mapReadRecord{c.records[0], {selfHunk: 0}}
-
-	got, err := readHunk(c.f, c.header, records, 1, cache)
-	require.NoError(t, err)
-	assert.Equal(t, want, got)
-
-	// That read filled the cache, so this one is the hit that could hand back its buffer.
-	hit, err := readHunk(c.f, c.header, records, 1, cache)
-	require.NoError(t, err)
-
-	for i := range hit {
-		hit[i] ^= 0xFF
+	for i, raw := range batch {
+		assert.Equal(t, want, raw, "hunk %d", i)
 	}
 
-	again, err := readHunk(c.f, c.header, records, 1, cache)
-	require.NoError(t, err)
-	assert.Equal(t, want, again, "a caller's edits must not reach the next read")
+	for i := range batch[0] {
+		batch[0][i] ^= 0xFF
+	}
+
+	assert.Equal(t, want, batch[1], "one hunk's edits must not reach another in the same batch")
+	assert.Equal(t, want, batch[2])
 }
 
-func TestReadHunkRejectsASelfReferenceCycle(t *testing.T) {
+func TestSourceHunkRejectsASelfReferenceCycle(t *testing.T) {
 	t.Parallel()
 
-	records := []mapReadRecord{{selfHunk: 1}, {selfHunk: 0}}
-
-	_, err := readHunk(nil, fileHeader{hunkBytes: hunkBytes}, records, 0, &hunkCache{})
+	_, err := sourceHunk([]mapReadRecord{{selfHunk: 1}, {selfHunk: 0}}, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cycle")
+}
+
+func firstHunk(t *testing.T, c *chdFile) []byte {
+	t.Helper()
+
+	batch, err := decompressBatch(c.f, c.header, c.records, 0, 1)
+	require.NoError(t, err)
+
+	return batch[0]
 }

@@ -118,16 +118,10 @@ func Verify(ctx context.Context, path string, progress io.Writer) (VerifyReport,
 	rawHash := sha1.New() //nolint:gosec // SHA1 is required by the CHD v5 format
 
 	remaining := c.header.logicalBytes
-	cache := &hunkCache{}
 
-	for hunkIdx := range c.records {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return VerifyReport{}, fmt.Errorf("verify %s: %w", path, ctxErr)
-		}
-
-		raw, hunkErr := readHunk(c.f, c.header, c.records, hunkIdx, cache)
+	for raw, hunkErr := range hunkSeq(ctx, c) {
 		if hunkErr != nil {
-			return VerifyReport{}, fmt.Errorf("%s: hunk %d: %w", path, hunkIdx, hunkErr)
+			return VerifyReport{}, fmt.Errorf("%s: %w", path, hunkErr)
 		}
 
 		// The digest covers the logical size, so a final part-used hunk contributes only its claimed bytes.
@@ -182,10 +176,10 @@ func FirstSector(path string) ([]byte, error) {
 	}
 	defer c.close()
 
-	raw, err := readHunk(c.f, c.header, c.records, 0, &hunkCache{})
+	batch, err := decompressBatch(c.f, c.header, c.records, 0, 1)
 	if err != nil {
-		return nil, fmt.Errorf("%s: hunk 0: %w", path, err)
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 
-	return raw[:sectorBytes], nil
+	return batch[0][:sectorBytes], nil
 }

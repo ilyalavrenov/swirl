@@ -3,6 +3,7 @@ package chd
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -133,11 +134,12 @@ func TestWriteMultiTrack(t *testing.T) {
 	}, got)
 }
 
+// Spans several read batches, with a fill that repeats every 256 sectors so most hunks
+// deduplicate. A hunk arriving out of order shows up as the wrong sector index.
 func TestWriteSectorDataRoundtrip(t *testing.T) {
 	t.Parallel()
 
-	// Fill each sector with its own index so a reordering is visible.
-	const sectors = 16
+	const sectors = 2*hunksPerBatch*framesPerHunk + 5
 
 	data := make([]byte, sectors*sectorBytes)
 	for i := range data {
@@ -151,6 +153,8 @@ func TestWriteSectorDataRoundtrip(t *testing.T) {
 		Data:   bytes.NewReader(data),
 	}})
 
+	assert.Positive(t, selfReferences(t, path), "the repeated hunks must deduplicate")
+
 	outputDir := t.TempDir()
 	_, err := Read(t.Context(), path, outputDir, io.Discard)
 	require.NoError(t, err)
@@ -162,6 +166,26 @@ func TestWriteSectorDataRoundtrip(t *testing.T) {
 		assert.Equal(t, data[sec*sectorBytes:(sec+1)*sectorBytes],
 			got[sec*sectorBytes:(sec+1)*sectorBytes], "sector %d", sec)
 	}
+}
+
+// How many hunks a written CHD stores as a reference to an earlier one.
+func selfReferences(t *testing.T, path string) int {
+	t.Helper()
+
+	c, err := openCHD(path)
+	require.NoError(t, err)
+
+	defer c.close()
+
+	n := 0
+
+	for _, r := range c.records {
+		if r.selfHunk >= 0 {
+			n++
+		}
+	}
+
+	return n
 }
 
 // TestWriteHeader pins the CHD v5 header layout with literal offsets rather than
@@ -254,25 +278,40 @@ func TestWriteBytes(t *testing.T) {
 	assert.Equal(t, int64(2*hunkBytes), WriteBytes([]Track{makeTrack(1, disc.TrackTypeMode1, 9, 0, 0)}))
 }
 
-// TestCompressBatchStoresIncompressibleHunks covers the branch a Dreamcast disc
-// never reaches: its subcode is always zeros, which leaves enough headroom that
-// deflate wins on every real hunk. The CHD format still allows a stored hunk and
-// the map has to record it as one.
-func TestCompressBatchStoresIncompressibleHunks(t *testing.T) {
+func TestCompressBatch(t *testing.T) {
 	t.Parallel()
 
 	raw := make([]byte, hunkBytes)
 	_, err := rand.Read(raw)
 	require.NoError(t, err)
 
-	var buf bytes.Buffer
+	// A Dreamcast disc never reaches this branch: its zero subcode leaves deflate enough
+	// headroom to win on every real hunk.
+	t.Run("stores an incompressible hunk", func(t *testing.T) {
+		t.Parallel()
 
-	records := make([]hunkRecord, 1)
-	require.NoError(t, compressBatch(&buf, records, 0, [][]byte{raw}))
+		var buf bytes.Buffer
 
-	assert.Equal(t, uint8(mapCompNone), records[0].compType)
-	assert.Equal(t, raw, buf.Bytes(), "an incompressible hunk is stored verbatim")
-	assert.Equal(t, uint32(hunkBytes), records[0].length)
+		records := make([]hunkRecord, 1)
+		require.NoError(t, compressBatch(&buf, records, 0, [][]byte{raw}, map[[sha1.Size]byte]int{}))
+
+		assert.Equal(t, uint8(mapCompNone), records[0].compType)
+		assert.Equal(t, raw, buf.Bytes(), "an incompressible hunk is stored verbatim")
+		assert.Equal(t, uint32(hunkBytes), records[0].length)
+	})
+
+	t.Run("references a repeat instead of storing it twice", func(t *testing.T) {
+		t.Parallel()
+
+		var buf bytes.Buffer
+
+		records := make([]hunkRecord, 2)
+		require.NoError(t, compressBatch(&buf, records, 0, [][]byte{raw, raw}, map[[sha1.Size]byte]int{}))
+
+		assert.Equal(t, uint8(mapCompSelf), records[1].compType)
+		assert.Equal(t, 0, records[1].selfHunk)
+		assert.Equal(t, raw, buf.Bytes(), "the repeat adds nothing to the data area")
+	})
 }
 
 // TestUint48BE pins the full width of a stored file offset: a truncated

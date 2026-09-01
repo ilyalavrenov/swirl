@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -43,6 +44,12 @@ const (
 	// Trim a wider big-endian read to CHD's packed 24- and 48-bit fields.
 	mask24 = 0xFFFFFF
 	mask48 = 0xFFFFFFFFFFFF
+
+	// Hunks decompressed at once: a larger batch amortises the sync but holds more buffers.
+	hunksPerBatch = 256
+
+	// Far past any disc, so a larger size is a damaged field. The map is allocated from it.
+	maxLogicalBytes = 64 << 30
 )
 
 // Raw DEFLATE has no checksum: damage can decode cleanly into the wrong bytes, which no decoder error would report.
@@ -73,8 +80,8 @@ type fileHeader struct {
 	combinedSHA1 []byte
 }
 
-// An unsupported codec is rejected rather than decoded to plausible garbage. The rest is
-// checked against the file size: no divide by zero, no allocation the file cannot fill.
+// An unsupported codec is rejected rather than decoded to plausible garbage, and every
+// size is bounded before anything is allocated from it.
 
 func readHeader(f *os.File, path string) (fileHeader, error) {
 	info, err := f.Stat()
@@ -137,12 +144,13 @@ func readHeader(f *os.File, path string) (fileHeader, error) {
 		return fileHeader{}, fmt.Errorf("%s: metadata offset %d is outside the file", path, h.metaOffset)
 	}
 
-	// The hunk count rounds up: a trailing part-used hunk still counts, and flooring
-	// would shift every later read. Every hunk stores a byte, so file size caps it.
-	h.numHunks = int((h.logicalBytes + int64(h.hunkBytes) - 1) / int64(h.hunkBytes))
-	if int64(h.numHunks) > h.size {
-		return fileHeader{}, fmt.Errorf("%s: header claims %d hunks in a %d byte file", path, h.numHunks, h.size)
+	if h.logicalBytes > maxLogicalBytes {
+		return fileHeader{}, fmt.Errorf("%s: header claims %d bytes, larger than any disc", path, h.logicalBytes)
 	}
+
+	// Rounds up: a trailing part-used hunk still counts. File size bounds nothing here,
+	// because a self-referenced hunk stores no bytes of its own.
+	h.numHunks = int((h.logicalBytes + int64(h.hunkBytes) - 1) / int64(h.hunkBytes))
 
 	return h, nil
 }
@@ -199,7 +207,7 @@ func Read(ctx context.Context, inputPath, outputDir string, progress io.Writer) 
 	}
 
 	writer := newTrackWriter(c.tracks, outFiles)
-	if err := extractHunks(ctx, c.f, c.header, c.records, writer, progress); err != nil {
+	if err := extractHunks(ctx, c, writer, progress); err != nil {
 		return nil, fmt.Errorf("%s: %w", inputPath, err)
 	}
 
@@ -230,6 +238,23 @@ func newTrackWriter(tracks []TrackInfo, files []*os.File) *trackWriter {
 		realLeft: tracks[0].RealFrames,
 		padLeft:  tracks[0].TotalFrames - tracks[0].RealFrames,
 	}
+}
+
+// Sectors past the last track are dropped rather than refused: they are padding the
+// hunk's CRC has already covered.
+func (w *trackWriter) writeHunk(raw []byte) error {
+	for off := 0; off+slotBytes <= len(raw); off += slotBytes {
+		more, err := w.writeSector(raw[off : off+sectorBytes])
+		if err != nil {
+			return err
+		}
+
+		if !more {
+			return nil
+		}
+	}
+
+	return nil
 }
 
 // Reports false once every track is full.
@@ -266,39 +291,16 @@ func (w *trackWriter) writeSector(sector []byte) (bool, error) {
 }
 
 // Hunks past the last track are still CRC-checked, so trailing data cannot hide corruption.
-func extractHunks(
-	ctx context.Context,
-	f *os.File,
-	h fileHeader,
-	records []mapReadRecord,
-	w *trackWriter,
-	progress io.Writer,
-) error {
-	framesInHunk := h.hunkBytes / slotBytes
-	cache := &hunkCache{}
-
-	for hunkIdx := range records {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("read: %w", err)
-		}
-
-		raw, err := readHunk(f, h, records, hunkIdx, cache)
-
+func extractHunks(ctx context.Context, c *chdFile, w *trackWriter, progress io.Writer) error {
+	for raw, err := range hunkSeq(ctx, c) {
 		if err != nil {
-			return fmt.Errorf("hunk %d: %w", hunkIdx, err)
+			return err
 		}
 
 		progress.Write(raw) //nolint:errcheck // progress reporting never affects the result
 
-		for fi := range framesInHunk {
-			more, wErr := w.writeSector(raw[fi*slotBytes : fi*slotBytes+sectorBytes])
-			if wErr != nil {
-				return wErr
-			}
-
-			if !more {
-				break
-			}
+		if err := w.writeHunk(raw); err != nil {
+			return err
 		}
 	}
 
@@ -638,9 +640,9 @@ type huffmanCodeEntry struct {
 	sym    int
 }
 
-// MAME derives each length's first code from the longest length down, not the
-// textbook shortest-first. The two agree only when every symbol shares one code
-// length, the only tree Write emits; chdman's trees decode to different symbols.
+// MAME derives each length's first code from the longest length down, not the textbook
+// shortest-first. They disagree on mixed-length trees, which Write now emits, so both
+// sides build their codes here.
 // https://github.com/rtissera/libchdr/blob/5f82799f2c8cad1e9cd26d39a0f8d36369a5534b/src/libchdr_huffman.c#L496
 func buildCanonicalCodes(symLen []int) ([]huffmanCodeEntry, error) {
 	var histo [maxHuffmanBits + 1]uint32
@@ -700,45 +702,90 @@ func decodeHuffmanSym(br *bitReader, codes []huffmanCodeEntry) (int, error) {
 	return 0, errors.New("no matching Huffman code")
 }
 
-// Holds the last hunk a self-reference resolved to. chdman points every duplicate hunk at
-// one stored copy, so a disc with a lot of silence asks for the same hunk thousands of times.
-type hunkCache struct {
-	idx int
-	raw []byte
-}
-
-// Resolves a self-reference to the hunk holding the data, then checks the map's CRC,
-// so a hunk that decompresses cleanly into the wrong bytes cannot reach a caller.
-func readHunk(f *os.File, h fileHeader, records []mapReadRecord, idx int, cache *hunkCache) ([]byte, error) {
-	duplicate := false
-
+// Follows a self-reference to the hunk that holds the data.
+func sourceHunk(records []mapReadRecord, idx int) (int, error) {
 	for range maxSelfChain {
-		rec := records[idx]
-		if rec.selfHunk < 0 {
-			// Callers byte-swap audio in place, so a hit cannot hand out the cached buffer.
-			if cache.raw != nil && cache.idx == idx {
-				return bytes.Clone(cache.raw), nil
-			}
-
-			raw, err := readStoredHunk(f, h, rec)
-			if err != nil {
-				return nil, err
-			}
-
-			// Caching only what a reference reached keeps an all-distinct disc from paying
-			// for copies nothing reads back.
-			if duplicate {
-				cache.idx, cache.raw = idx, bytes.Clone(raw)
-			}
-
-			return raw, nil
+		if records[idx].selfHunk < 0 {
+			return idx, nil
 		}
 
-		idx = rec.selfHunk
-		duplicate = true
+		idx = records[idx].selfHunk
 	}
 
-	return nil, errors.New("self-references form a cycle")
+	return 0, errors.New("self-references form a cycle")
+}
+
+// Yields every hunk in stream order, decompressing a batch at a time.
+func hunkSeq(ctx context.Context, c *chdFile) iter.Seq2[[]byte, error] {
+	return func(yield func([]byte, error) bool) {
+		for start := 0; start < len(c.records); start += hunksPerBatch {
+			if err := ctx.Err(); err != nil {
+				yield(nil, err)
+
+				return
+			}
+
+			batch, err := decompressBatch(c.f, c.header, c.records, start, min(hunksPerBatch, len(c.records)-start))
+			if err != nil {
+				yield(nil, err)
+
+				return
+			}
+
+			for _, raw := range batch {
+				if !yield(raw, nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// Decodes hunks [start, start+n) in parallel, once per distinct stored hunk.
+func decompressBatch(f *os.File, h fileHeader, records []mapReadRecord, start, n int) ([][]byte, error) {
+	sources := make([]int, n)
+
+	for i := range sources {
+		src, err := sourceHunk(records, start+i)
+		if err != nil {
+			return nil, fmt.Errorf("hunk %d: %w", start+i, err)
+		}
+
+		sources[i] = src
+	}
+
+	out := make([][]byte, n)
+	errs := make([]error, n)
+	first := make(map[int]int, n)
+
+	var wg sync.WaitGroup
+
+	for i, src := range sources {
+		if _, dup := first[src]; dup {
+			continue
+		}
+
+		first[src] = i
+
+		wg.Go(func() { out[i], errs[i] = readStoredHunk(f, h, records[src]) })
+	}
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			return nil, fmt.Errorf("hunk %d: %w", sources[i], err)
+		}
+	}
+
+	// Callers byte-swap audio in place, so a repeat cannot be handed the same buffer.
+	for i, src := range sources {
+		if first[src] != i {
+			out[i] = bytes.Clone(out[first[src]])
+		}
+	}
+
+	return out, nil
 }
 
 func readStoredHunk(f *os.File, h fileHeader, rec mapReadRecord) ([]byte, error) {

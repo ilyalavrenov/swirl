@@ -23,7 +23,8 @@ import (
 //   - 60 frames of 2448 bytes is 7.5 hunks, so the hunk count must round up
 //   - chdman strips each MODE1 sector's sync header and P/Q parity (bitmap 0xff)
 //   - the audio is two hunk-sized blocks repeated, ABAB, so the third audio hunk
-//     is a self-reference and the fourth is a SELF_1 one past the previous target
+//     is a self-reference and the fourth is a SELF_1 one past the previous target,
+//     under chdman's own Huffman tree rather than the writer's fixed one
 //   - the audio track is stored byte-swapped
 const goldenPath = "testdata/golden.chd"
 
@@ -119,13 +120,32 @@ func TestChdmanReadsWhatWriteProduces(t *testing.T) {
 		audio[i] = byte(i*13 + 5)
 	}
 
+	// A B C A B A A drives every self-reference symbol the writer emits: a target spelled
+	// out in full, one past it, and the same one again. chdman verify is the authority.
+	block := func(fill byte) []byte {
+		b := make([]byte, framesPerHunk*sectorBytes)
+		for i := range b {
+			b[i] = fill ^ byte(i*13)
+		}
+
+		return b
+	}
+
+	a, b, c := block(0x11), block(0x22), block(0x33)
+	repeated := bytes.Join([][]byte{a, b, c, a, b, a, a}, nil)
+
 	// Not 4-frame aligned, so a padded FRAMES would start the audio three sectors late.
 	const dataFrames = 5
+
+	repeatedFrames := len(repeated) / sectorBytes
 
 	path := writeCHD(t, []Track{
 		makeTrack(1, "MODE1/2352", dataFrames, 0, 0x5A),
 		{Number: 2, Type: "AUDIO", Frames: 8, Data: bytes.NewReader(bytes.Clone(audio))},
+		{Number: 3, Type: "MODE1/2352", Frames: repeatedFrames, Data: bytes.NewReader(repeated)},
 	})
+
+	assert.Equal(t, 4, selfReferences(t, path), "A B C A B A A repeats four hunks")
 
 	out, err := exec.CommandContext(t.Context(), chdman, "verify", "-i", path).CombinedOutput()
 	require.NoError(t, err, "chdman verify: %s", out)
@@ -140,9 +160,11 @@ func TestChdmanReadsWhatWriteProduces(t *testing.T) {
 	// chdman concatenates a plain CD's tracks into one .bin.
 	got, err := os.ReadFile(filepath.Join(dir, "o.bin"))
 	require.NoError(t, err)
-	require.Len(t, got, (dataFrames+8)*sectorBytes, "chdman must see the real track lengths")
-	assert.Equal(t, audio, got[dataFrames*sectorBytes:],
+	require.Len(t, got, (dataFrames+8+repeatedFrames)*sectorBytes, "chdman must see the real track lengths")
+	assert.Equal(t, audio, got[dataFrames*sectorBytes:(dataFrames+8)*sectorBytes],
 		"chdman must see the audio in the order the source had, at the sector it starts on")
+	assert.Equal(t, repeated, got[(dataFrames+8)*sectorBytes:],
+		"and must resolve every self-reference back to the bytes it stands for")
 }
 
 // testdata/golden-gdrom.chd is the same idea at GD-ROM scale: a 105 MB disc that
