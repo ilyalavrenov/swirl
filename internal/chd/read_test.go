@@ -200,3 +200,29 @@ func TestLogicalBytesRejectsNonCHD(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a CHD file")
 }
+
+// Frame counts from a real GD-ROM, whose files match redump once the pregap lands in track 2.
+func TestPregapBelongsToTheTrackItPrecedes(t *testing.T) {
+	t.Parallel()
+
+	tracks := []TrackInfo{
+		{Number: 1, CUEType: disc.TrackTypeMode1, TotalFrames: 600, RealFrames: 450, GDROM: true},
+		{Number: 2, CUEType: disc.TrackTypeAudio, TotalFrames: 44400, RealFrames: 9918, GDROM: true},
+		{Number: 3, CUEType: disc.TrackTypeMode1, TotalFrames: 504150, RealFrames: 504150, GDROM: true},
+	}
+
+	assignPregaps(tracks)
+
+	assert.Equal(t, 0, tracks[0].Pregap, "nothing precedes the first track")
+	assert.Equal(t, standardPregap, tracks[1].Pregap, "the audio track after a data track has one")
+	assert.Equal(t, 0, tracks[2].Pregap, "the high-density boundary is a session gap, not a pregap")
+
+	assert.Equal(t, []span{{0, 450}, {450, 10518}, {45000, 549150}}, newTrackWriter(tracks, nil).spans,
+		"track 2's file starts 150 frames before its data, and nothing claims the area gap")
+
+	// Without PAD to record it, a folded pregap is indistinguishable from a disc that
+	// never had one, so nothing is invented.
+	tracks[0].TotalFrames, tracks[1].Pregap = tracks[0].RealFrames, 0
+	assignPregaps(tracks)
+	assert.Equal(t, 0, tracks[1].Pregap)
+}

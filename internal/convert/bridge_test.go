@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -266,4 +267,26 @@ func TestCueSheetForGDROMTagWithoutBoundary(t *testing.T) {
 	})
 
 	assert.NotContains(t, got, hdaRem)
+}
+
+// Moving the pregap changes the length padBridge sizes the bridge from, and getting that
+// wrong starts the high-density area at the wrong sector. Frame counts from a real GD-ROM.
+func TestShiftPregapsFeedsPadBridge(t *testing.T) {
+	t.Parallel()
+
+	tracks := []chd.Track{
+		{Number: 1, Type: disc.TrackTypeMode1, Frames: 450},
+		{Number: 2, Type: disc.TrackTypeAudio, Frames: 10068, Pregap: 150, Data: bytes.NewReader(nil)},
+		{Number: 3, Type: disc.TrackTypeMode1, Frames: 504150},
+	}
+
+	shiftPregaps(tracks, true)
+
+	assert.Equal(t, 150, tracks[0].TrailingPregap, "the data track carries the pregap")
+	assert.Equal(t, 9918, tracks[1].Frames, "which stops being the audio track's own data")
+
+	padBridge(tracks, 1)
+	assert.Equal(t, 44400, tracks[1].StoredFrames)
+	assert.Equal(t, disc.HDAStartLBA, chd.PadFrames(tracks[0].Frames+tracks[0].TrailingPregap)+tracks[1].StoredFrames,
+		"track 3 has to begin exactly on the boundary")
 }

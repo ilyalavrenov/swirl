@@ -60,9 +60,8 @@ type TrackInfo struct {
 	CUEType     string // "MODE1/2352", "AUDIO", etc.
 	TotalFrames int    // CHD sector slots allocated to this track (includes PAD)
 	RealFrames  int    // frames with actual data (TotalFrames - PAD)
-
-	// GDROM means the track came from a CHGD entry, so the HDA boundary applies.
-	GDROM bool
+	Pregap      int    // frames before this track's data that redump keeps at the head of its file
+	GDROM       bool   // from a CHGD entry, so the high-density boundary applies
 }
 
 // size bounds what the rest of the header is allowed to claim.
@@ -222,22 +221,35 @@ func Read(ctx context.Context, inputPath, outputDir string, progress io.Writer) 
 	return c.tracks, nil
 }
 
-// Routes each hunk's sectors to the right track file, dropping trailing PAD frames.
+// Routes sectors by LBA. A range starts before its track when a pregap heads the file;
+// frames between ranges are padding no file wants.
 type trackWriter struct {
-	tracks   []TrackInfo
-	files    []*os.File
-	idx      int
-	realLeft int
-	padLeft  int
+	tracks []TrackInfo
+	files  []*os.File
+	spans  []span
+	lba    int
+	idx    int
 }
 
+type span struct{ start, end int }
+
 func newTrackWriter(tracks []TrackInfo, files []*os.File) *trackWriter {
-	return &trackWriter{
-		tracks:   tracks,
-		files:    files,
-		realLeft: tracks[0].RealFrames,
-		padLeft:  tracks[0].TotalFrames - tracks[0].RealFrames,
+	spans := make([]span, len(tracks))
+
+	startLBA := 0
+	for i, t := range tracks {
+		spans[i] = span{startLBA - t.Pregap, startLBA + t.RealFrames}
+		startLBA += t.TotalFrames
 	}
+
+	// chdman folds a pregap into the track before it either as PAD or as that track's own
+	// frames. In the second case the ranges overlap, and the frames belong to the later
+	// track: the earlier one ends where its successor's file begins.
+	for i := 1; i < len(spans); i++ {
+		spans[i-1].end = min(spans[i-1].end, spans[i].start)
+	}
+
+	return &trackWriter{tracks: tracks, files: files, spans: spans}
 }
 
 // Sectors past the last track are dropped rather than refused: they are padding the
@@ -259,21 +271,18 @@ func (w *trackWriter) writeHunk(raw []byte) error {
 
 // Reports false once every track is full.
 func (w *trackWriter) writeSector(sector []byte) (bool, error) {
-	for w.idx < len(w.tracks) && w.realLeft == 0 && w.padLeft == 0 {
+	lba := w.lba
+	w.lba++
+
+	for w.idx < len(w.spans) && lba >= w.spans[w.idx].end {
 		w.idx++
-		if w.idx < len(w.tracks) {
-			w.realLeft = w.tracks[w.idx].RealFrames
-			w.padLeft = w.tracks[w.idx].TotalFrames - w.tracks[w.idx].RealFrames
-		}
 	}
 
-	if w.idx >= len(w.tracks) {
+	if w.idx >= len(w.spans) {
 		return false, nil
 	}
 
-	if w.realLeft == 0 {
-		w.padLeft--
-
+	if lba < w.spans[w.idx].start {
 		return true, nil
 	}
 
@@ -284,8 +293,6 @@ func (w *trackWriter) writeSector(sector []byte) (bool, error) {
 	if _, err := w.files[w.idx].Write(sector); err != nil {
 		return false, fmt.Errorf("write track %d: %w", w.tracks[w.idx].Number, err)
 	}
-
-	w.realLeft--
 
 	return true, nil
 }
@@ -392,7 +399,31 @@ func parseTrackMetas(metas []rawMeta) ([]TrackInfo, error) {
 		})
 	}
 
+	assignPregaps(tracks)
+
 	return tracks, nil
+}
+
+// Two seconds, per the Red Book. chdman folds these frames into the preceding track,
+// as PAD or as track data, so the split redump records has to be derived.
+const standardPregap = 150
+
+// A track opening the high-density area is a session boundary, not a pregap.
+func assignPregaps(tracks []TrackInfo) {
+	startLBA, afterData, prevPad := 0, false, 0
+
+	// Only where the CHD records the gap. chdman can instead fold a pregap into the
+	// preceding track's own frames, leaving nothing to distinguish it from a disc that
+	// never had one, and inventing frames there would corrupt both.
+	for i, t := range tracks {
+		if t.GDROM && afterData && prevPad >= standardPregap && startLBA != disc.HDAStartLBA &&
+			disc.IsAudio(t.CUEType) {
+			tracks[i].Pregap = standardPregap
+		}
+
+		afterData, prevPad = !disc.IsAudio(t.CUEType), t.TotalFrames-t.RealFrames
+		startLBA += t.TotalFrames
+	}
 }
 
 func parseKV(s string) map[string]string {

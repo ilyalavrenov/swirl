@@ -212,7 +212,7 @@ func gdiToCUE(ctx context.Context, gdiPath, outputDir string, opts Options) (Res
 			lines = append(lines, hdaRem)
 		}
 
-		lines = append(lines, cueStanza(t.Number, t.Type, dstName)...)
+		lines = append(lines, cueStanza(t.Number, t.Type, dstName, 0)...)
 	}
 
 	if err := writeSheet(out.path("disc.cue"), lines); err != nil {
@@ -283,6 +283,7 @@ func cueToCHD(ctx context.Context, cuePath, outputPath string, opts Options) (Re
 	}
 	defer closeAll()
 
+	shiftPregaps(tracks, l.bridge >= 0)
 	padBridge(tracks, l.bridge)
 
 	return writeCHD(ctx, outputPath, tracks, opts)
@@ -305,6 +306,7 @@ func gdiToCHD(ctx context.Context, gdiPath, outputPath string, opts Options) (Re
 	}
 	defer closeAll()
 
+	shiftPregaps(tracks, l.bridge >= 0)
 	padBridge(tracks, l.bridge)
 
 	return writeCHD(ctx, outputPath, tracks, opts)
@@ -373,6 +375,29 @@ func openTracks(workingDir string, layout []TrackDesc) ([]chd.Track, func(), err
 	return tracks, closeAll, nil
 }
 
+// Only a GD-ROM can hold a pregap for the next track: CHT2 carries FRAMES alone, with no
+// PAD to set those frames apart. Reads stay sequential, so the earlier track just takes
+// the head of the later one's file. Runs before padBridge, which sizes from these lengths.
+func shiftPregaps(tracks []chd.Track, gdrom bool) {
+	if !gdrom {
+		return
+	}
+
+	for i := 1; i < len(tracks); i++ {
+		pregap := tracks[i].Pregap
+		if pregap == 0 {
+			continue
+		}
+
+		tracks[i].Frames -= pregap
+		tracks[i-1].TrailingPregap = pregap
+		tracks[i-1].Data = io.MultiReader(
+			tracks[i-1].Data,
+			io.LimitReader(tracks[i].Data, int64(pregap)*disc.SectorBytes),
+		)
+	}
+}
+
 // Inflates tracks[idx] so the tracks up to and including it fill exactly
 // disc.HDAStartLBA sectors. idx is negative when the disc has no high-density area.
 func padBridge(tracks []chd.Track, idx int) {
@@ -382,7 +407,7 @@ func padBridge(tracks []chd.Track, idx int) {
 
 	sumPrev := 0
 	for _, t := range tracks[:idx] {
-		sumPrev += chd.PadFrames(t.Frames)
+		sumPrev += chd.PadFrames(t.Frames + t.TrailingPregap)
 	}
 
 	// >=, not >: StoredFrames doubles as the CHGD tag, and a GD-ROM read as CHT2 has its
@@ -404,7 +429,7 @@ func cueSheetFor(tracks []chd.TrackInfo) []string {
 			lines = append(lines, hdaRem)
 		}
 
-		lines = append(lines, cueStanza(t.Number, t.CUEType, disc.TrackFileName(t.Number, t.CUEType))...)
+		lines = append(lines, cueStanza(t.Number, t.CUEType, disc.TrackFileName(t.Number, t.CUEType), t.Pregap)...)
 		startLBA += t.TotalFrames
 	}
 
@@ -436,13 +461,22 @@ func gdiLine(number, startLBA int, cueType, filename string) string {
 	return fmt.Sprintf("%d %d %d %d %s 0 ", number, startLBA, trackType, disc.SectorBytes, filename)
 }
 
-func cueStanza(number int, cueType, filename string) []string {
+func cueStanza(number int, cueType, filename string, pregap int) []string {
 	// AUDIO is a TRACK datatype, not a FILE type; chdman rejects a sheet using it there.
-	return []string{
+	lines := []string{
 		fmt.Sprintf("FILE %q BINARY", filename),
 		fmt.Sprintf("  TRACK %02d %s", number, cueType),
-		"    INDEX 01 00:00:00",
 	}
+
+	// INDEX 00, not a PREGAP command: the frames are in the file, and a burner told
+	// otherwise would write a second copy of them.
+	if pregap > 0 {
+		lines = append(lines, "    INDEX 00 00:00:00", "    INDEX 01 "+cue.FramesAsMSF(pregap))
+	} else {
+		lines = append(lines, "    INDEX 01 00:00:00")
+	}
+
+	return lines
 }
 
 func writeSheet(path string, lines []string) error {

@@ -118,6 +118,7 @@ func describeCHD(path string) (Description, error) {
 			Type:     t.CUEType,
 			StartLBA: lba,
 			Frames:   t.RealFrames,
+			Pregap:   t.Pregap,
 		})
 
 		// Pad frames still occupy sectors.
