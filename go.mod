@@ -3,7 +3,7 @@ module github.com/ilyalavrenov/swirl
 go 1.27.0
 
 require (
-	github.com/klauspost/compress v1.19.2
+	github.com/klauspost/compress v1.20.0
 	github.com/mewkiz/flac v1.0.14
 	github.com/stretchr/testify v1.12.1
 	github.com/ulikunitz/xz v0.5.16
