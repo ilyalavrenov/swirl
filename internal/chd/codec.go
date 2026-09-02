@@ -105,8 +105,8 @@ func decompressFramed(data []byte, hunkBytes int, base, sub blockDecoder) ([]byt
 	return assembleHunk(sectorData, subcodeData, data[:eccBytes], hunkBytes), nil
 }
 
-// A set bitmap bit means chdman stripped that sector's sync header and parity; Write
-// never does, and cdfl passes no bitmap at all.
+// A set bitmap bit means that sector's sync header and parity were stripped; cdfl passes
+// no bitmap at all.
 func assembleHunk(sectorData, subcodeData, stripped []byte, hunkBytes int) []byte {
 	out := make([]byte, hunkBytes)
 	tables := newECCTables()
@@ -115,7 +115,7 @@ func assembleHunk(sectorData, subcodeData, stripped []byte, hunkBytes int) []byt
 		copy(out[i*slotBytes:], sectorData[i*sectorBytes:(i+1)*sectorBytes])
 		copy(out[i*slotBytes+sectorBytes:], subcodeData[i*subcodeBytes:(i+1)*subcodeBytes])
 
-		if len(stripped) > 0 && stripped[i/bitsPerByte]&(1<<(i%bitsPerByte)) != 0 {
+		if len(stripped) > 0 && eccStripped(stripped, i) {
 			tables.restoreSector(out[i*slotBytes : i*slotBytes+sectorBytes])
 		}
 	}

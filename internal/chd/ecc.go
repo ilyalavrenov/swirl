@@ -1,5 +1,7 @@
 package chd
 
+import "bytes"
+
 // chdman strips each sector's 12-byte sync pattern and 276 bytes of Reed-Solomon P/Q
 // parity, both derivable from the rest, and flags the sector in the hunk's ECC bitmap.
 // https://github.com/mamedev/mame/blob/33c42e9e0e89c879e0fc5b654cc70b947bf1473c/src/lib/util/cdrom.cpp#L1436-L1445
@@ -53,6 +55,28 @@ func (t eccTables) restoreSector(sector []byte) {
 	// Q covers the P field as well as the data, so P has to be written first.
 	t.writeParity(sector, eccPCount, eccPComp, eccPMajorMult, eccPMinorInc, sector[eccPOffset:])
 	t.writeParity(sector, eccQCount, eccQComp, eccQMajorMult, eccQMinorInc, sector[eccQOffset:])
+}
+
+// Only what regenerates exactly may go: deliberately bad parity has to survive.
+func (t eccTables) strippable(sector []byte) bool {
+	// Cheap reject: audio has no sync pattern.
+	if !bytes.HasPrefix(sector, syncHeader()) {
+		return false
+	}
+
+	rebuilt := bytes.Clone(sector)
+	t.restoreSector(rebuilt)
+
+	return bytes.Equal(rebuilt, sector)
+}
+
+// The ECC bitmap carries one flag per frame of the hunk, LSB first.
+func eccStripped(bitmap []byte, frame int) bool {
+	return bitmap[frame/bitsPerByte]&(1<<(frame%bitsPerByte)) != 0
+}
+
+func markECCStripped(bitmap []byte, frame int) {
+	bitmap[frame/bitsPerByte] |= 1 << (frame % bitsPerByte)
 }
 
 func (t eccTables) writeParity(sector []byte, majorCount, minorCount, majorMult, minorInc int, out []byte) {
