@@ -571,15 +571,37 @@ func splitHunk(hunkData []byte) ([]byte, []byte) {
 	return sectorData, subcodeData
 }
 
-// CDZLIB wire format: an ECC bitmap of ceil(frames/8) bytes (always 0, we never
-// strip), the 2-byte big-endian length of the deflated sector block, then
-// DEFLATE(sectors) and DEFLATE(subcode). The subcode block must be present even for
-// Dreamcast discs that carry none: libchdr builds WANT_SUBCODE=1 and fails without it.
+// Zeroes what restoreSector can rebuild, freeing 288 incompressible bytes a sector.
+func stripECC(sectorData []byte, eccBytes int) []byte {
+	ecc := make([]byte, eccBytes)
+	tables := newECCTables()
+
+	for i := range len(sectorData) / sectorBytes {
+		sector := sectorData[i*sectorBytes : (i+1)*sectorBytes]
+		if !tables.strippable(sector) {
+			continue
+		}
+
+		clear(sector[:len(syncHeader())])
+		clear(sector[eccPOffset:])
+		markECCStripped(ecc, i)
+	}
+
+	return ecc
+}
+
+// CDZLIB wire format: an ECC bitmap of ceil(frames/8) bytes, the 2-byte big-endian length
+// of the deflated sector block, then DEFLATE(sectors) and DEFLATE(subcode). The subcode
+// block must be present even for Dreamcast discs that carry none: libchdr builds
+// WANT_SUBCODE=1 and fails without it.
 // https://github.com/rtissera/libchdr/blob/5f82799f2c8cad1e9cd26d39a0f8d36369a5534b/include/libchdr/chdconfig.h#L6
 // https://github.com/rtissera/libchdr/blob/5f82799f2c8cad1e9cd26d39a0f8d36369a5534b/src/libchdr_chd.c#L818
 func compressCDZLIB(hunkData []byte) ([]byte, error) {
 	frames := len(hunkData) / slotBytes
 	sectorData, subcodeData := splitHunk(hunkData)
+
+	eccBytes := (frames + bitsPerByte - 1) / bitsPerByte // = 1 for framesPerHunk=8
+	ecc := stripECC(sectorData, eccBytes)
 
 	baseCmp, err := zlibCompress(sectorData)
 	if err != nil {
@@ -591,8 +613,8 @@ func compressCDZLIB(hunkData []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	eccBytes := (frames + bitsPerByte - 1) / bitsPerByte // = 1 for framesPerHunk=8
 	out := make([]byte, eccBytes+2+len(baseCmp)+len(subcodeCmp))
+	copy(out, ecc)
 	out[eccBytes] = byte(len(baseCmp) >> bitsPerByte) //nolint:gosec // G115: upper byte of 16-bit length
 	out[eccBytes+1] = byte(len(baseCmp))              //nolint:gosec // G115: lower byte of 16-bit length
 	copy(out[eccBytes+2:], baseCmp)
