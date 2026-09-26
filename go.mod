@@ -6,7 +6,7 @@ require (
 	github.com/klauspost/compress v1.20.1
 	github.com/mewkiz/flac v1.0.14
 	github.com/stretchr/testify v1.12.1
-	github.com/ulikunitz/xz v0.5.16
+	github.com/ulikunitz/xz v0.5.17
 	github.com/urfave/cli/v3 v3.11.0
 	golang.org/x/term v0.46.0
 )
