@@ -27,7 +27,7 @@ jobs:
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           # renovate: datasource=github-releases depName=golangci/golangci-lint
-          version: "v2.14.0"
+          version: "v2.15.0"
       - uses: reviewdog/action-actionlint@b76d06f8570118465db3190c9a08f1b29d341aa1 # v1.80.3
         with:
           reporter: github-check

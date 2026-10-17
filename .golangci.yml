@@ -65,7 +65,7 @@ linters:
     exhaustive:
       check:
         - switch
-        - map
+        - mapliteral
     gocognit:
       min-complexity: 20
     goconst:
